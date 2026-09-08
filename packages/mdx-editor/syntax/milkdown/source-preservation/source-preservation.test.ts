@@ -467,6 +467,31 @@ describe("script execution probes are inert", () => {
 });
 
 describe("the preview is chrome, not content", () => {
+    it("shows only the HTML table while preserving and updating its source", async () => {
+        const markdown = '<table class="confluenceTable">\n  <tbody>\n    <tr><th>指标</th><th>说明</th></tr>\n    <tr><td><strong>基本介绍</strong></td><td>来源各自官网。</td></tr>\n  </tbody>\n</table>\n';
+        const { host, root } = await mount(`${ANCHOR}${markdown}`);
+        const block = nodesOfType(root, HTML_SOURCE_NODE)[0];
+        const source = block.querySelector<HTMLPreElement>("pre");
+        const preview = previews(block)[0];
+
+        expect(source?.hidden).toBe(true);
+        expect(preview.closest("[hidden]")).toBeNull();
+        expect(preview.querySelectorAll("table")).toHaveLength(1);
+        expect(preview.querySelectorAll("tr")).toHaveLength(2);
+        expect(preview.querySelector("strong")?.textContent).toBe("基本介绍");
+
+        expect(host.replaceSourceRange({ anchor: 0, head: 0 }, "X")).toBe(true);
+        host.flush();
+        expect(host.getMarkdown()).toBe(`X${ANCHOR}${markdown}`);
+
+        const offset = host.getMarkdown().indexOf("来源各自官网。");
+        expect(host.replaceSourceRange({ anchor: offset, head: offset }, "说明：")).toBe(true);
+        host.flush();
+        expect(preview.textContent).toContain("说明：来源各自官网。");
+        expect(source?.hidden).toBe(true);
+        expect(host.getMarkdown()).toBe(`X${ANCHOR}${markdown.replace("来源各自官网。", "说明：来源各自官网。")}`);
+    });
+
     it("renders a sanitized preview beside the source", async () => {
         const { root } = await mount(
             `${ANCHOR}<div class="note">\n  <p>Hello.</p>\n</div>\n`,

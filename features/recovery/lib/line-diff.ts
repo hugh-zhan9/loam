@@ -4,8 +4,11 @@ const MAX_LCS_CELLS = 1_000_000;
 const FALLBACK_SYNC_WINDOW = 32;
 
 export function buildLineDiff(leftText: string, rightText: string): DiffLine[] {
-    const leftLines = splitLines(leftText);
-    const rightLines = splitLines(rightText);
+    return buildLineSequenceDiff(splitLines(leftText), splitLines(rightText));
+}
+
+/** Also accepts lines with terminators when exact source bytes matter. */
+export function buildLineSequenceDiff(leftLines: string[], rightLines: string[]): DiffLine[] {
     const commonPrefixLength = countCommonPrefix(leftLines, rightLines);
     const commonSuffix = findCommonSuffix(
         leftLines,

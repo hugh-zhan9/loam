@@ -26,7 +26,7 @@ Markdown remains the only persisted content and the only content exchanged with 
 
 ## Markdown Syntax And Source Preservation
 
-Structured syntax plugins own their parser, schema, serializer, NodeView, clipboard behavior, and focused tests. The first-release contract includes frontmatter, footnotes, wikilinks, Mermaid, math, and callouts. Safe HTML is edited in an explicit source block and rendered only through a sanitized inert preview.
+Structured syntax plugins own their parser, schema, serializer, NodeView, clipboard behavior, and focused tests. The first-release contract includes frontmatter, footnotes, wikilinks, Mermaid, math, and callouts. Supported HTML tables use the existing editable table schema in WYSIWYG mode. Cell text, formatting, merged cells, and multiple paragraphs can be edited directly; save keeps HTML and preserves untouched source and authored attributes. Attributes are source metadata and never copied into the live DOM. Complex or malformed tables that cannot be represented retain the sanitized inert HTML preview. Other HTML blocks also show only this preview; their preserved source is editable in source mode (⌘⇧M).
 
 If syntax cannot be represented safely, the editor must preserve it in a visible source fallback instead of deleting or guessing how to normalize it. An unedited fallback serializes its original source slice byte-for-byte. Unknown syntax that can be represented by this fallback is not a fatal visual-parse error.
 
@@ -64,8 +64,10 @@ Escaping such text instead would be a one-way ratchet. A typed `array[0]` saved 
 
 Workspace/Document session state owns Markdown, dirty, drafts, watcher reload decisions, conflicts, and the last-clean disk fingerprint. The editor adapter cannot read or write files, clear dirty, delete drafts, or decide whether an external version wins.
 
-- A clean document may accept an external reload and update its clean baseline.
-- A dirty document receiving an external change keeps the user's content and enters the existing conflict/diff flow.
+- An open Document window accepts external changes automatically. Watch batches have a bounded delivery interval even during continuous directory activity. Stale disk reads cannot replace a newer reload or local save.
+- For Document windows, the last saved Markdown is the three-way merge base. Disjoint source edits merge without a prompt, including separate cells in one table row when their ranges can be identified. Identical changes are applied once. Overlapping differing edits or ambiguous insertion boundaries retain local content and enter the conflict/diff flow. The session owns this decision and reuses recovery's line diff; no new store or file writer is introduced.
+- A successful merge updates the disk baseline/fingerprint and remains dirty if local changes are still unsaved. It does not write the merged version to disk or delete recovery drafts. Reads use the latest local edits only while their original disk baseline is still current.
+- Workspace tabs retain their existing dirty-document conflict policy.
 - A recovery draft survives clean reload and is deleted only after save success or explicit discard.
 - Saves carry the last-clean fingerprint; backend rejection preserves in-memory content and recovery data.
 - A discard flow that requires draft cleanup stops if cleanup fails.

@@ -83,8 +83,8 @@ function createPreview(doc: Document, nodeType: string): HTMLElement {
 }
 
 /**
- * Editable raw source plus an inert preview, for a block of HTML the editor
- * refuses to represent structurally.
+ * An inert preview backed by preserved raw HTML. Source editing is available
+ * through the document's source mode.
  */
 class HtmlSourceNodeView implements NodeView {
     readonly dom: HTMLElement;
@@ -104,6 +104,9 @@ class HtmlSourceNodeView implements NodeView {
 
         const source = doc.createElement("pre");
         source.className = "mdx-html-source-code";
+        // Retain contentDOM for source mapping and serialization without showing
+        // a second copy of the HTML above its rendered content.
+        source.hidden = true;
         this.contentDOM = doc.createElement("code");
         this.contentDOM.setAttribute(SOURCE_ELEMENT_ATTR, "");
         this.contentDOM.setAttribute("spellcheck", "false");

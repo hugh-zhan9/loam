@@ -336,43 +336,29 @@ describe("find — the same query means the same thing on either surface", () =>
     }
 });
 
-describe("find — a match with no faithful place in the source", () => {
+describe("find — named character references", () => {
     /**
      * A named character reference is one character of document text spelled
-     * with five of source, and the offset map declines to place text it cannot
-     * account for character by character. So every match in this paragraph is
-     * one the adapter cannot put anywhere.
+     * with five of source. Both surfaces must use the same decoded-text map.
      */
     const ENTITY = "A &amp; B\n";
 
-    it("is dropped and reported, on both surfaces, rather than guessed at", async () => {
-        // The text really is there to match: the document reads "A & B", and a
-        // search of it finds the "a". What is missing is a source range.
+    it("maps the decoded ampersand to the whole reference on both surfaces", async () => {
         const session = await openSession(ENTITY);
-        const visual = session.handle.current!.find(request("a"));
+        const visual = session.handle.current!.find(request("&"));
 
-        expect(visual.matches).toEqual([]);
-        expect(visual.activeMatchId).toBeNull();
-        expect(
-            session.diagnostics.map((diagnostic) => diagnostic.code),
-        ).toEqual(["editor_position_unmapped"]);
+        expect(slices(ENTITY, visual)).toEqual(["&amp;"]);
+        expect(session.diagnostics).toEqual([]);
 
         await session.switchTo("source");
-        // Cleared after the swap, not before it: leaving the visual surface
-        // reads the caret to carry it across, and on this document that read is
-        // unplaceable too — a true report, and not the one under test here.
         session.diagnostics.length = 0;
-        const source = session.handle.current!.find(request("a"));
+        const source = session.handle.current!.find(request("&"));
 
         expect(source.matches).toEqual(visual.matches);
-        expect(
-            session.diagnostics.map((diagnostic) => diagnostic.code),
-        ).toEqual(["editor_position_unmapped"]);
+        expect(session.diagnostics).toEqual([]);
     }, 60000);
 
     it("reports nothing at all for a query the text does not contain", async () => {
-        // Control: the diagnostic above is raised by a match that could not be
-        // placed, not by opening this document.
         const session = await openSession(ENTITY);
         expect(session.handle.current!.find(request("zzz")).matches).toEqual([]);
         expect(session.diagnostics).toEqual([]);

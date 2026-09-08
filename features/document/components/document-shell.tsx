@@ -51,6 +51,7 @@ import {
   documentWindowTitle,
   markDocumentDeleted,
   markDocumentSaved,
+  mergeExternalDocumentChange,
   updateDocumentMarkdown,
 } from "../lib/document-state";
 import type { DraftRecord } from "@/features/recovery/lib/types";
@@ -101,6 +102,7 @@ export function DocumentShell({
   const [fileWatchPreferencesReady, setFileWatchPreferencesReady] =
     useState(false);
   const stateRef = useRef<LoadedDocumentState | null>(null);
+  const externalReadSequenceRef = useRef(0);
   const saveRef = useRef<() => Promise<boolean>>(async () => false);
   const draftFlushRef = useRef<() => Promise<void>>(async () => {});
   const closePromptInFlightRef = useRef(false);
@@ -118,6 +120,7 @@ export function DocumentShell({
   useEffect(() => {
     let cancelled = false;
 
+    externalReadSequenceRef.current += 1;
     setState(null);
     setError(null);
     setDraftRecovery(null);
@@ -287,12 +290,47 @@ export function DocumentShell({
     [],
   );
 
+  // The document session remains the owner of both the disk baseline and the
+  // unsaved edits. A merge changes in-memory content; it does not write disk.
+  const acceptExternalVersion = useCallback((file: {
+    content: string;
+    fingerprint: string;
+    displayPath: string;
+  }) => {
+    const current = stateRef.current;
+    if (!current) return;
+    const merged = mergeExternalDocumentChange(current, file);
+    if (merged) {
+      editorSession.declareReplace({
+        documentId: current.realPath,
+        markdown: merged.markdown,
+        reason: current.dirty ? "conflict-resolution" : "clean-reload",
+      });
+      stateRef.current = merged;
+      setState(merged);
+      setExternalConflict(null);
+      setConflictDiffOpen(false);
+      return;
+    }
+    const conflict = createDocumentExternalConflict(current, file);
+    const next = { ...current, deletedOnDisk: false };
+    stateRef.current = next;
+    setState(next);
+    setExternalConflict({
+      path: conflict.path,
+      diskMarkdown: conflict.diskMarkdown,
+      displayPath: file.displayPath,
+    });
+    setConflictDiffOpen(true);
+  }, [editorSession]);
+
   const save = useCallback(async () => {
     if (!state || saving) {
       return false;
     }
 
     const saveSnapshot = state;
+    externalReadSequenceRef.current += 1;
     setSaving(true);
 
     try {
@@ -302,6 +340,15 @@ export function DocumentShell({
         saveSnapshot.markdown,
         saveSnapshot.fingerprint,
       );
+      const latest = stateRef.current;
+      if (!latest || !sameDocumentPath(latest.realPath, saveSnapshot.realPath)
+        || latest.fingerprint !== saveSnapshot.fingerprint
+        || latest.savedMarkdown !== saveSnapshot.savedMarkdown) {
+        // A newer disk version has already been accepted while this write's
+        // response was in flight. Its baseline and conflict state must survive.
+        return false;
+      }
+      externalReadSequenceRef.current += 1;
       const savedStillCurrent = isCurrentDocumentSnapshot(
         stateRef.current,
         saveSnapshot,
@@ -326,18 +373,16 @@ export function DocumentShell({
         return false;
       }
 
+      const readSequence = ++externalReadSequenceRef.current;
       try {
         const diskFile = await readDocumentFile(saveSnapshot.realPath);
-        const conflict = createDocumentExternalConflict(
-          saveSnapshot,
-          diskFile,
-        );
-        setExternalConflict({
-          path: conflict.path,
-          diskMarkdown: conflict.diskMarkdown,
-          displayPath: diskFile.displayPath,
-        });
-        setConflictDiffOpen(true);
+        const latest = stateRef.current;
+        if (readSequence === externalReadSequenceRef.current
+          && latest && sameDocumentPath(latest.realPath, saveSnapshot.realPath)
+          && latest.fingerprint === saveSnapshot.fingerprint
+          && latest.savedMarkdown === saveSnapshot.savedMarkdown) {
+          acceptExternalVersion(diskFile);
+        }
       } catch (readConflictError) {
         void dialogs.alert({
           title: "保存失败",
@@ -352,7 +397,7 @@ export function DocumentShell({
     } finally {
       setSaving(false);
     }
-  }, [dialogs, finalizeSavedDocumentSnapshot, saving, state]);
+  }, [acceptExternalVersion, dialogs, finalizeSavedDocumentSnapshot, saving, state]);
 
   useEffect(() => {
     saveRef.current = save;
@@ -425,6 +470,7 @@ export function DocumentShell({
       return;
     }
 
+    externalReadSequenceRef.current += 1;
     setSaving(true);
     try {
       await draftFlushRef.current();
@@ -432,6 +478,13 @@ export function DocumentShell({
         conflict.path,
         current.markdown,
       );
+      const latest = stateRef.current;
+      if (!latest || !sameDocumentPath(latest.realPath, current.realPath)
+        || latest.fingerprint !== current.fingerprint
+        || latest.savedMarkdown !== current.savedMarkdown) {
+        return;
+      }
+      externalReadSequenceRef.current += 1;
       const savedStillCurrent = isCurrentDocumentSnapshot(
         stateRef.current,
         current,
@@ -461,6 +514,7 @@ export function DocumentShell({
       return;
     }
 
+    externalReadSequenceRef.current += 1;
     try {
       const file = await readDocumentFile(conflict.path);
       editorSession.declareReplace({
@@ -498,83 +552,27 @@ export function DocumentShell({
     }
   }, []);
 
-  const reloadCleanExternalDocument = useCallback(async () => {
+  const refreshExternalDocument = useCallback(async () => {
     const snapshot = stateRef.current;
-
-    if (!snapshot || snapshot.dirty) {
-      return;
-    }
-
+    if (!snapshot) return;
+    const readSequence = ++externalReadSequenceRef.current;
     try {
       const file = await readDocumentFile(snapshot.realPath);
       const latest = stateRef.current;
-
       if (
+        readSequence !== externalReadSequenceRef.current ||
         !latest ||
-        latest.dirty ||
-        !sameDocumentPath(latest.realPath, snapshot.realPath)
-      ) {
-        return;
-      }
-
-      editorSession.declareReplace({
-        documentId: latest.realPath,
-        markdown: file.content,
-        reason: "clean-reload",
-      });
-      setState((current) => {
-        if (
-          !current ||
-          current.dirty ||
-          !sameDocumentPath(current.realPath, snapshot.realPath)
-        ) {
-          return current;
-        }
-
-        return applyExternalDocumentReload(current, file);
-      });
-      setExternalConflict(null);
-      setConflictDiffOpen(false);
+        !sameDocumentPath(latest.realPath, snapshot.realPath) ||
+        latest.fingerprint !== snapshot.fingerprint ||
+        latest.savedMarkdown !== snapshot.savedMarkdown
+      ) return;
+      // Read against the same disk baseline, but merge with the latest local
+      // edits, including typing that happened while the disk read was pending.
+      acceptExternalVersion(file);
     } catch (reloadError) {
       console.warn("Failed to reload externally changed document.", reloadError);
     }
-  }, [editorSession]);
-
-  const showExternalDocumentConflict = useCallback(async () => {
-    const snapshot = stateRef.current;
-
-    if (!snapshot || !snapshot.dirty) {
-      return;
-    }
-
-    try {
-      const file = await readDocumentFile(snapshot.realPath);
-      const latest = stateRef.current;
-
-      if (
-        !latest ||
-        !latest.dirty ||
-        !sameDocumentPath(latest.realPath, snapshot.realPath)
-      ) {
-        return;
-      }
-
-      const conflict = createDocumentExternalConflict(latest, file);
-      setState((current) =>
-        current && sameDocumentPath(current.realPath, snapshot.realPath)
-          ? { ...current, deletedOnDisk: false }
-          : current,
-      );
-      setExternalConflict({
-        path: conflict.path,
-        diskMarkdown: conflict.diskMarkdown,
-        displayPath: file.displayPath,
-      });
-      setConflictDiffOpen(true);
-    } catch (conflictError) {
-      console.warn("Failed to load externally changed document.", conflictError);
-    }
-  }, []);
+  }, [acceptExternalVersion]);
 
   const handleDocumentFileWatchEvent = useCallback(
     (event: FrontendFileWatchEvent) => {
@@ -598,6 +596,7 @@ export function DocumentShell({
 
       if (event.kind === "deleted" || event.kind === "renamed") {
         if (eventPathMatchesCurrent && !newPathMatchesCurrent) {
+          externalReadSequenceRef.current += 1;
           setState((latest) =>
             latest && sameDocumentPath(latest.realPath, current.realPath)
               ? markDocumentDeleted(latest)
@@ -609,14 +608,9 @@ export function DocumentShell({
         }
       }
 
-      if (current.dirty) {
-        void showExternalDocumentConflict();
-        return;
-      }
-
-      void reloadCleanExternalDocument();
+      void refreshExternalDocument();
     },
-    [reloadCleanExternalDocument, showExternalDocumentConflict],
+    [refreshExternalDocument],
   );
 
   const handleDocumentFileWatchError = useCallback(
@@ -705,6 +699,7 @@ export function DocumentShell({
       await draftFlushRef.current();
       await writeDocumentMarkdownPath(selectedPath, saveSnapshot.markdown);
       const file = await readDocumentFile(selectedPath);
+      externalReadSequenceRef.current += 1;
       const savedStillCurrent = isCurrentDocumentSnapshot(
         stateRef.current,
         saveSnapshot,
@@ -954,13 +949,12 @@ export function DocumentShell({
 
   const handleEditorSurfaceChange = useCallback(
     (documentId: string, markdown: string) => {
-      setState((current) =>
-        // A change reported for a file this window is no longer showing must
-        // not be written into the file it is showing now.
-        current && current.realPath === documentId
-          ? updateDocumentMarkdown(current, markdown)
-          : current,
-      );
+      const current = stateRef.current;
+      if (current && current.realPath === documentId) {
+        const next = updateDocumentMarkdown(current, markdown);
+        stateRef.current = next;
+        setState(next);
+      }
     },
     [],
   );

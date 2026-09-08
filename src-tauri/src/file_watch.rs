@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Sender};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -11,6 +11,9 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::document::document_fingerprint;
 use crate::models::{FileWatchEventPayload, WatchStartResult, WatchStopResult, WorkspaceError};
+
+#[path = "file_watch_delivery.rs"]
+mod delivery;
 
 const WATCH_COALESCE_DELAY: Duration = Duration::from_millis(200);
 
@@ -318,30 +321,22 @@ fn spawn_delivery_loop(
     thread::spawn(move || {
         let mut pending_events = Vec::new();
 
-        loop {
-            if stop_receiver.try_recv().is_ok() {
-                break;
-            }
-
-            match event_receiver.recv_timeout(WATCH_COALESCE_DELAY) {
-                Ok(Ok(event)) => {
+        delivery::run(
+            event_receiver,
+            stop_receiver,
+            WATCH_COALESCE_DELAY,
+            |action| match action {
+                delivery::Delivery::Event(Ok(event)) => {
                     pending_events.extend(pending_events_from_notify_event(&runtime.scope, event));
                 }
-                Ok(Err(error)) => {
+                delivery::Delivery::Event(Err(error)) => {
                     emit_watch_error(&runtime, error.to_string());
                 }
-                Err(RecvTimeoutError::Timeout) => {
-                    if stop_receiver.try_recv().is_ok() {
-                        break;
-                    }
+                delivery::Delivery::Flush => {
                     flush_pending_events(&runtime, &mut pending_events);
                 }
-                Err(RecvTimeoutError::Disconnected) => {
-                    flush_pending_events(&runtime, &mut pending_events);
-                    break;
-                }
-            }
-        }
+            },
+        );
     });
 }
 

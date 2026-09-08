@@ -298,6 +298,104 @@ describe("document file safety with the adapter surface", () => {
     expect(draftDelete).not.toHaveBeenCalled();
   });
 
+  it("merges separate edits in the real editor and saves against the new disk fingerprint", async () => {
+    readDocumentFile
+      .mockResolvedValueOnce(documentFile("# Disk\n\nOriginal body\n", "base"))
+      .mockResolvedValueOnce(documentFile("# Disk\n\nExternal body\n", "disk-1"))
+      .mockResolvedValueOnce(documentFile("# Disk\n\nSecond body\n", "disk-2"));
+    saveDocumentFile.mockResolvedValue({ fingerprint: "saved" });
+    await mountDocument();
+    await act(async () => { paste(surface(), "USER-EDIT"); await flushPromises(); });
+    await act(async () => { externalChange(); await flushPromises(); });
+    expect(editorText()).toContain("USER-EDIT");
+    expect(editorText()).toContain("External body");
+    expect(host.textContent).not.toContain("文件已被外部修改");
+    expect(host.textContent).toContain("● note.md");
+    expect(draftDelete).not.toHaveBeenCalled();
+    await act(async () => { externalChange(); await flushPromises(); });
+    expect(editorText()).toContain("USER-EDIT");
+    expect(editorText()).toContain("Second body");
+    await act(async () => { getButton("保存").click(); await flushPromises(); });
+    expect(saveDocumentFile).toHaveBeenCalledWith("/tmp/note.md", expect.stringContaining("USER-EDITDisk\n\nSecond body"), "disk-2");
+  });
+
+  it("merges typing made while a clean external read is pending", async () => {
+    let resolveRead!: (file: ReturnType<typeof documentFile>) => void;
+    readDocumentFile
+      .mockResolvedValueOnce(documentFile("# Disk\n\nOriginal body\n", "base"))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveRead = resolve; }));
+    await mountDocument();
+    await act(async () => { externalChange(); await flushPromises(); });
+    await act(async () => { paste(surface(), "USER-EDIT"); await flushPromises(); });
+    await act(async () => {
+      resolveRead(documentFile("# Disk\n\nExternal body\n", "external"));
+      await flushPromises();
+    });
+    expect(editorText()).toContain("USER-EDIT");
+    expect(editorText()).toContain("External body");
+    expect(host.textContent).not.toContain("文件已被外部修改");
+    expect(host.textContent).toContain("● note.md");
+  });
+
+  it("does not resurrect an external read captured before a successful local save", async () => {
+    let resolveRead!: (file: ReturnType<typeof documentFile>) => void;
+    readDocumentFile
+      .mockResolvedValueOnce(documentFile(DISK_MARKDOWN, "base"))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveRead = resolve; }));
+    saveDocumentFile.mockResolvedValue({ fingerprint: "saved" });
+    await mountDocument();
+    await act(async () => { externalChange(); await flushPromises(); });
+    await act(async () => { paste(surface(), "USER-EDIT"); await flushPromises(); });
+    await act(async () => { getButton("保存").click(); await flushPromises(); });
+    await act(async () => { resolveRead(documentFile(DISK_MARKDOWN, "base")); await flushPromises(); });
+    expect(editorText()).toContain("USER-EDIT");
+    expect(host.textContent).not.toContain("● note.md");
+    expect(host.textContent).not.toContain("文件已被外部修改");
+  });
+
+  it("does not clear a newer overlapping conflict when an older failed-save read completes", async () => {
+    let resolveOlder!: (file: ReturnType<typeof documentFile>) => void;
+    readDocumentFile
+      .mockResolvedValueOnce(documentFile("# Disk\n\nBody\n", "base"))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveOlder = resolve; }))
+      .mockResolvedValueOnce(documentFile("# Remote\n\nNewest body\n", "newest"));
+    saveDocumentFile.mockRejectedValue({ errorCode: "external_modified" });
+    await mountDocument();
+    await act(async () => { paste(surface(), "USER-EDIT"); await flushPromises(); });
+    await act(async () => { getButton("保存").click(); await flushPromises(); });
+    await act(async () => { externalChange(); await flushPromises(); });
+    expect(host.textContent).toContain("文件已被外部修改");
+    expect(host.textContent).toContain("Newest body");
+    await act(async () => {
+      resolveOlder(documentFile("# Disk\n\nOlder body\n", "older"));
+      await flushPromises();
+    });
+    expect(host.textContent).toContain("文件已被外部修改");
+    expect(host.textContent).toContain("Newest body");
+    expect(editorText()).toContain("USER-EDIT");
+    expect(editorText()).not.toContain("Older body");
+  });
+
+  it("keeps a newer accepted disk baseline when an older save response arrives", async () => {
+    let resolveSave!: (value: { fingerprint: string }) => void;
+    readDocumentFile
+      .mockResolvedValueOnce(documentFile("# Disk\n\nOriginal body\n", "base"))
+      .mockResolvedValueOnce(documentFile("# Disk\n\nNew body\n", "newer"));
+    saveDocumentFile
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveSave = resolve; }))
+      .mockResolvedValueOnce({ fingerprint: "latest-save" });
+    await mountDocument();
+    await act(async () => { paste(surface(), "USER-EDIT"); await flushPromises(); });
+    await act(async () => { getButton("保存").click(); await flushPromises(); });
+    await act(async () => { externalChange(); await flushPromises(); });
+    await act(async () => { resolveSave({ fingerprint: "older-save" }); await flushPromises(); });
+    expect(editorText()).toContain("USER-EDIT");
+    expect(editorText()).toContain("New body");
+    expect(draftDelete).not.toHaveBeenCalled();
+    await act(async () => { getButton("保存").click(); await flushPromises(); });
+    expect(saveDocumentFile).toHaveBeenLastCalledWith("/tmp/note.md", expect.stringContaining("New body"), "newer");
+  });
+
   it("keeps a recovery draft across a clean reload", async () => {
     readDocumentFile
       .mockResolvedValueOnce(documentFile(DISK_MARKDOWN, "fingerprint-disk"))

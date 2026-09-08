@@ -136,8 +136,13 @@ npm install
 npx tauri dev          # 桌面端，附带渲染层的开发服务器
 npm run dev            # 只起渲染层，用于调 UI——它不是一个 Web 产品
 npx tauri build        # 产出 .app 与 .dmg
-npm run install:local  # 把构建好的应用拷进 /Applications 并重新签名
+./scripts/build-install.sh  # 一键构建 .app 并替换 /Applications/Loam.app
+npm run build:install  # 调用同一个 Shell 脚本
+npm run build:app      # 只构建 .app
+npm run install:local  # 安装已经构建好的 .app
 ```
+
+安装脚本 `scripts/install-local-app.mjs` 会先复制、签名并验证新包，再替换旧应用。安装前请保存编辑并关闭 Loam；应用仍在运行或签名失败时，脚本会停止并保留旧包。成功后会输出旧包备份路径；文档和应用数据不在替换范围内。可以用 `LOAM_BUILT_APP`、`LOAM_INSTALL_APP` 指定构建包和安装位置。安装后运行 `open /Applications/Loam.app` 启动。
 
 往 `app/globals.css` 里加主题需要先清渲染层缓存——`rm -rf .next`——因为 Turbopack 会在热更新时重新输出改过的规则，但**不会**重新解析声明调色板用的 `@plugin`。
 

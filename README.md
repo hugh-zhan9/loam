@@ -196,8 +196,13 @@ npm install
 npx tauri dev        # desktop, with the renderer's dev server
 npm run dev          # renderer only, for UI debugging — not a web product
 npx tauri build      # a signed-to-nothing .app and .dmg
-npm run install:local  # copy the built app to /Applications and re-sign it
+./scripts/build-install.sh  # build the .app and replace /Applications/Loam.app
+npm run build:install  # invoke the same shell script
+npm run build:app      # build the .app only
+npm run install:local  # install an already-built .app
 ```
+
+`scripts/install-local-app.mjs` stages, signs, and verifies the new bundle before replacing the installed app. Save your edits and close Loam before installation; a running app or signing failure stops installation and leaves the old app in place. Successful installation prints the previous bundle’s backup path; documents and application data are outside the replacement. `LOAM_BUILT_APP` and `LOAM_INSTALL_APP` override the source and destination. Run `open /Applications/Loam.app` after installation.
 
 Adding a theme to `app/globals.css` needs the renderer's cache cleared —
 `rm -rf .next` — because Turbopack re-emits edited rules on a hot reload but does not

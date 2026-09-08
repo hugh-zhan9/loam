@@ -9,6 +9,7 @@ import { authoredEscapePlugins } from "./escapes";
 import { footnotePlugins } from "./footnote";
 import { frontmatterPlugins } from "./frontmatter";
 import { imagePlugins } from "./image";
+import { htmlTablePlugins } from "./html-table";
 import { relaxListItemContent } from "./list-item-content";
 import { mathPlugins } from "./math";
 import { mermaidPlugins } from "./mermaid";
@@ -148,6 +149,7 @@ export function createMdxMilkdownPlugins(
         ...footnotePlugins(),
         ...wikilinkPlugins(),
         ...linkPlugins(),
+        ...htmlTablePlugins(),
         ...sourcePreservationPlugins(),
         // Escapes last: its writer wrapping has to sit over the final `text`
         // handler, and its reading pass registers itself both before every

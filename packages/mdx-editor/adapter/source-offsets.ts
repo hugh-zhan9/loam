@@ -236,6 +236,17 @@ function alignValue(
         const source = markdown.charCodeAt(cursor);
         const wanted = value.charCodeAt(index);
 
+        // `&amp;` starts with the same character it decodes to. Consume the
+        // reference as a unit before accepting that first ampersand literally.
+        const reference = source === AMPERSAND ? referenceEnd(markdown, cursor, to) : 0;
+        const referenceUnits = reference > 0 ? referenceLength(markdown.slice(cursor, reference)) : 0;
+        if (referenceUnits > 0 && index + referenceUnits <= value.length) {
+            for (let unit = 0; unit < referenceUnits; unit += 1) offsets[index + unit] = cursor;
+            index += referenceUnits;
+            cursor = reference;
+            atLineStart = false;
+            continue;
+        }
         if (source === wanted) {
             offsets[index] = cursor;
             index += 1;
@@ -261,19 +272,6 @@ function alignValue(
             cursor += markdown.charCodeAt(cursor + 1) === LINE_FEED ? 2 : 1;
             atLineStart = true;
             continue;
-        }
-        if (source === AMPERSAND) {
-            const end = referenceEnd(markdown, cursor, to);
-            const decoded = end > 0 ? referenceLength(markdown.slice(cursor, end)) : 0;
-            if (decoded > 0 && index + decoded <= value.length) {
-                for (let unit = 0; unit < decoded; unit += 1) {
-                    offsets[index + unit] = cursor;
-                }
-                index += decoded;
-                cursor = end;
-                atLineStart = false;
-                continue;
-            }
         }
         if (
             atLineStart &&

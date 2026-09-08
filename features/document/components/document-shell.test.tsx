@@ -167,6 +167,30 @@ describe("DocumentShell draft recovery", () => {
     expect(host.textContent).toContain("# Crash draft");
   });
 
+  it("keeps the newest external version when disk reads finish out of order", async () => {
+    let resolveOlder!: (file: ReturnType<typeof documentFile>) => void;
+    let resolveLatest!: (file: ReturnType<typeof documentFile>) => void;
+    readDocumentFile
+      .mockResolvedValueOnce(documentFile("# Initial", "initial"))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveOlder = resolve; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveLatest = resolve; }));
+    draftGet.mockResolvedValueOnce({ draft: null, fileExists: true });
+    await renderDocumentShell(root);
+    await act(async () => {
+      fileWatchOptions.current?.onEvent({ kind: "changed", path: "/tmp/note.md", eventTime: "1", fingerprint: "older" });
+      fileWatchOptions.current?.onEvent({ kind: "changed", path: "/tmp/note.md", eventTime: "2", fingerprint: "latest" });
+      resolveLatest(documentFile("# Latest", "latest"));
+      await flushPromises();
+    });
+    expect(host.textContent).toContain("# Latest");
+    await act(async () => {
+      resolveOlder(documentFile("# Older", "older"));
+      await flushPromises();
+    });
+    expect(host.textContent).toContain("# Latest");
+    expect(host.textContent).not.toContain("# Older");
+  });
+
   it("keeps the standalone editor body inside the available document height", async () => {
     readDocumentFile.mockResolvedValueOnce(
       documentFile("# Disk", "fingerprint-disk"),

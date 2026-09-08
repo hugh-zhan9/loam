@@ -1,4 +1,5 @@
 import type { DocumentFileResult, LoadedDocumentState } from "./types";
+import { mergeExternalMarkdown } from "./merge-external-markdown";
 
 export function createLoadedDocumentState(
   file: DocumentFileResult,
@@ -62,6 +63,22 @@ export function applyExternalDocumentReload(
     savedMarkdown: file.content,
     fingerprint: file.fingerprint,
     dirty: false,
+    deletedOnDisk: false,
+  };
+}
+
+export function mergeExternalDocumentChange(
+  state: LoadedDocumentState,
+  file: { content: string; fingerprint: string },
+): LoadedDocumentState | null {
+  const markdown = mergeExternalMarkdown(state.savedMarkdown, state.markdown, file.content);
+  if (markdown === null) return null;
+  return {
+    ...state,
+    markdown,
+    savedMarkdown: file.content,
+    fingerprint: file.fingerprint,
+    dirty: markdown !== file.content,
     deletedOnDisk: false,
   };
 }
