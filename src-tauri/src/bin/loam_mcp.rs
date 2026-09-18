@@ -191,7 +191,7 @@ fn handle_request(workspace: &str, request: JsonRpcRequest) -> JsonRpcResponse {
         "initialize" => Ok(initialize_result()),
         "notifications/initialized" => Ok(Value::Null),
         "tools/list" => Ok(list_tools_result()),
-        "tools/call" => dispatch_tool_call(workspace, request.params),
+        "tools/call" => dispatch_tool_call(workspace, request.params).map(tool_call_result),
         method => Err(protocol_error(
             -32601,
             format!("Method not found: {method}"),
@@ -228,6 +228,18 @@ fn initialize_result() -> Value {
 fn list_tools_result() -> Value {
     let tools: Vec<Value> = TOOLS.iter().map(|name| tool_descriptor(name)).collect();
     json!({ "tools": tools })
+}
+
+fn tool_call_result(structured_content: Value) -> Value {
+    let text = structured_content.to_string();
+    json!({
+        "content": [{
+            "type": "text",
+            "text": text
+        }],
+        "structuredContent": structured_content,
+        "isError": false
+    })
 }
 
 #[cfg(test)]
@@ -722,11 +734,35 @@ mod tests {
         let response = handle_request(root.path().to_str().unwrap(), request);
 
         assert!(response.error.is_none(), "{:?}", response.error);
-        let result = response.result.unwrap();
+        let envelope = response.result.unwrap();
+        let result = &envelope["structuredContent"];
         // Memory is off until a workspace asks for it, and the model has to be
         // downloaded before anything can be written.
         assert_eq!(result["enabled"], false);
         assert!(result["model"].as_str().is_some());
+    }
+
+    #[test]
+    fn tool_call_result_uses_the_mcp_content_envelope() {
+        let root = tempfile::tempdir().unwrap();
+        let request = parse_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_status","arguments":{}}}"#,
+        )
+        .unwrap();
+
+        let response = handle_request(root.path().to_str().unwrap(), request);
+
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result = response.result.unwrap();
+        assert_eq!(result["isError"], false);
+        let structured = &result["structuredContent"];
+        assert_eq!(structured["enabled"], false);
+
+        let content = result["content"].as_array().expect("missing MCP content");
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        let text: Value = serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(&text, structured);
     }
 
     #[test]
@@ -758,7 +794,7 @@ mod tests {
 
         assert!(response.error.is_none());
         let result = response.result.unwrap();
-        let statuses = result.as_array().unwrap();
+        let statuses = result["structuredContent"].as_array().unwrap();
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0]["agent_source"], "codex");
     }
@@ -776,7 +812,8 @@ mod tests {
         let response = handle_request(root.path().to_str().unwrap(), request);
 
         assert!(response.error.is_none());
-        let result = response.result.unwrap();
+        let envelope = response.result.unwrap();
+        let result = &envelope["structuredContent"];
         assert_eq!(result["logs_included"], false);
         assert_eq!(result["logs"], json!([]));
         assert_eq!(result["log_warning"], "logs_unavailable");
