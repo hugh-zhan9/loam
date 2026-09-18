@@ -62,6 +62,126 @@ fn saves_workspace_asset_when_stale_predictable_temp_file_exists() {
 }
 
 #[test]
+fn workspace_asset_link_climbs_back_to_the_root_from_a_subdirectory() {
+    let root = tempdir().unwrap();
+    let filename = "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a.png";
+    let bytes = vec![1, 2, 3, 4];
+    let document_dir = root.path().join("docs").join("loopx").join("plans");
+    std::fs::create_dir_all(&document_dir).unwrap();
+    let document_path = document_dir.join("Untitled.md");
+    std::fs::write(&document_path, "").unwrap();
+
+    let saved = save_image_asset(
+        Some(root.path().to_string_lossy().into_owned()),
+        Some(document_path.to_string_lossy().into_owned()),
+        "paste.png".to_string(),
+        bytes.clone(),
+    )
+    .unwrap();
+
+    assert!(!saved.used_fallback);
+    assert_eq!(saved.markdown_path, format!("../../../.assets/{filename}"));
+    assert_eq!(
+        std::fs::canonicalize(&saved.stored_path).unwrap(),
+        std::fs::canonicalize(root.path().join(".assets").join(filename)).unwrap()
+    );
+
+    // Read the link back as plain text against the document's own directory.
+    // Going through load_image_asset alone would only prove the two sides run
+    // the same helper, not that the link points where it says it does.
+    assert_eq!(
+        std::fs::read(document_dir.join(&saved.markdown_path)).unwrap(),
+        bytes
+    );
+
+    let loaded = load_image_asset(
+        Some(root.path().to_string_lossy().into_owned()),
+        Some(document_path.to_string_lossy().into_owned()),
+        saved.markdown_path,
+    )
+    .unwrap();
+
+    assert_eq!(loaded.bytes, bytes);
+}
+
+/// One level down is the ordinary layout, and `current_file_path` may arrive
+/// relative to the root rather than absolute.
+#[test]
+fn workspace_asset_link_climbs_one_level_for_a_relative_current_file_path() {
+    let root = tempdir().unwrap();
+    let filename = "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a.png";
+    let bytes = vec![1, 2, 3, 4];
+    let document_dir = root.path().join("notes");
+    std::fs::create_dir(&document_dir).unwrap();
+    std::fs::write(document_dir.join("doc.md"), "").unwrap();
+
+    let saved = save_image_asset(
+        Some(root.path().to_string_lossy().into_owned()),
+        Some("notes/doc.md".to_string()),
+        "paste.png".to_string(),
+        bytes.clone(),
+    )
+    .unwrap();
+
+    assert!(!saved.used_fallback);
+    assert_eq!(saved.markdown_path, format!("../.assets/{filename}"));
+    assert_eq!(
+        std::fs::read(document_dir.join(&saved.markdown_path)).unwrap(),
+        bytes
+    );
+
+    let loaded = load_image_asset(
+        Some(root.path().to_string_lossy().into_owned()),
+        Some("notes/doc.md".to_string()),
+        saved.markdown_path,
+    )
+    .unwrap();
+
+    assert_eq!(loaded.bytes, bytes);
+}
+
+#[test]
+fn workspace_asset_link_stays_bare_for_a_document_at_the_root() {
+    let root = tempdir().unwrap();
+    let filename = "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a.png";
+    let document_path = root.path().join("doc.md");
+    std::fs::write(&document_path, "# Doc").unwrap();
+
+    let saved = save_image_asset(
+        Some(root.path().to_string_lossy().into_owned()),
+        Some(document_path.to_string_lossy().into_owned()),
+        "paste.png".to_string(),
+        vec![1, 2, 3, 4],
+    )
+    .unwrap();
+
+    assert!(!saved.used_fallback);
+    assert_eq!(saved.markdown_path, format!(".assets/{filename}"));
+}
+
+#[test]
+fn falls_back_to_global_assets_for_a_document_outside_the_workspace_root() {
+    let root = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let document_path = outside.path().join("doc.md");
+    std::fs::write(&document_path, "# Doc").unwrap();
+    let global_assets_dir = tempdir().unwrap();
+
+    let saved = save_image_asset_with_global_assets_dir(
+        Some(root.path().to_string_lossy().into_owned()),
+        Some(document_path.to_string_lossy().into_owned()),
+        "paste.png".to_string(),
+        vec![1, 2, 3, 4],
+        global_assets_dir.path(),
+    )
+    .unwrap();
+
+    assert!(saved.used_fallback);
+    assert!(std::path::Path::new(&saved.markdown_path).is_absolute());
+    assert!(!root.path().join(".assets").exists());
+}
+
+#[test]
 fn falls_back_to_global_assets_without_workspace_root() {
     let global_assets_dir = tempdir().unwrap();
     let result = save_image_asset_with_global_assets_dir(

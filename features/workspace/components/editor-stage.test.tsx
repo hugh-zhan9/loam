@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EditorStage } from "./editor-stage";
 import { createEditorSessionBinding } from "@/features/editor/lib/editor-session-binding";
 import type { MarkdownEditorSurfaceHandle } from "@/features/editor/components/markdown-editor-surface";
-import type { WorkspaceTab } from "../lib/types";
+import type { WorkspaceAction, WorkspaceTab } from "../lib/types";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
   .IS_REACT_ACT_ENVIRONMENT = true;
@@ -186,6 +186,54 @@ describe("EditorStage adapter surface wiring", () => {
     });
   });
 
+  it("writes a stored image link into the document exactly as it was handed over", async () => {
+    // A document below the workspace root gets a link that climbs back to the
+    // one .assets directory. Nothing between the store and the document may
+    // rewrite it, or it stops pointing at the file that was just written.
+    imageStorageMocks.storeImageForWorkspace.mockResolvedValue({
+      altText: "clip.png",
+      storedPath: "/tmp/ws/.assets/clip.png",
+      url: "../../.assets/clip.png",
+      usedFallback: false,
+    });
+    const dispatch = vi.fn();
+    const editorSurfaceRef: { current: MarkdownEditorSurfaceHandle | null } = {
+      current: null,
+    };
+    await renderQualificationStage(
+      {
+        tabId: "tab-nested",
+        path: "/tmp/ws/docs/plans/Untitled.md",
+        title: "Untitled.md",
+        dirty: false,
+        needsRenameOnFirstSave: false,
+        markdown: "alpha\n",
+      },
+      { editorSurfaceRef, onSelectionChange: vi.fn(), dispatch },
+    );
+
+    const surface = host.querySelector(".ProseMirror");
+    const file = new File(["image"], "clip.png", { type: "image/png" });
+    const event = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "clipboardData", {
+      value: { files: [file], items: [], types: ["Files"], getData: () => "" },
+    });
+
+    await act(async () => {
+      surface?.dispatchEvent(event);
+      await flushPromises();
+    });
+
+    const markdown = dispatch.mock.calls
+      .map(([action]) => action as WorkspaceAction)
+      .filter((action) => action.type === "tab/contentChanged")
+      .at(-1);
+    expect(markdown).toBeDefined();
+    expect(markdown).toMatchObject({
+      markdown: expect.stringContaining("(../../.assets/clip.png)"),
+    });
+  });
+
   it("publishes a surface handle that reveals a Markdown source range", async () => {
     const editorSurfaceRef: { current: MarkdownEditorSurfaceHandle | null } = {
       current: null,
@@ -213,6 +261,7 @@ describe("EditorStage adapter surface wiring", () => {
         tabId: string,
         selection: Record<string, unknown> | null,
       ) => void;
+      dispatch?: (action: WorkspaceAction) => void;
     },
   ) {
     await act(async () => {
@@ -220,7 +269,7 @@ describe("EditorStage adapter surface wiring", () => {
         <EditorStage
           rootPath="/tmp/ws"
           activeTab={activeTab}
-          dispatch={vi.fn()}
+          dispatch={options.dispatch ?? vi.fn()}
           editorSession={createEditorSessionBinding()}
           editorSurfaceRef={options.editorSurfaceRef}
           pendingCliCommand={null}

@@ -55,12 +55,13 @@ fn save_image_asset_impl(
     bytes: Vec<u8>,
     global_assets_dir: Option<&Path>,
 ) -> Result<SaveImageAssetResult, WorkspaceError> {
-    let _ = current_file_path;
     let extension = image_extension(&name)?;
     let filename = format!("{}.{}", sha256_hex(&bytes), extension);
 
     if let Some(root_path) = root_path {
-        if let Ok(result) = save_workspace_asset(&root_path, &filename, &bytes) {
+        if let Ok(result) =
+            save_workspace_asset(&root_path, current_file_path.as_deref(), &filename, &bytes)
+        {
             return Ok(result);
         }
     }
@@ -184,19 +185,60 @@ pub fn load_image_asset_with_global_assets_dir(
 
 fn save_workspace_asset(
     root_path: &str,
+    current_file_path: Option<&str>,
     filename: &str,
     bytes: &[u8],
 ) -> Result<SaveImageAssetResult, WorkspaceError> {
     let root = canonicalize_workspace_root(root_path)?;
+    // Settle the link before creating anything: a document this workspace
+    // cannot write a link for should not leave an assets directory behind.
+    let document_dir = current_file_path
+        .map(|current_file_path| canonical_workspace_document_dir(&root, current_file_path))
+        .transpose()?;
+    let markdown_path = workspace_asset_markdown_path(&root, document_dir.as_deref(), filename)?;
     let assets_dir = ensure_workspace_assets_dir(&root)?;
     let stored_path = write_deduped_asset(&assets_dir, filename, bytes)?;
-    let markdown_path = format!(".assets/{filename}");
 
     Ok(SaveImageAssetResult {
         markdown_path,
         stored_path: path_to_string(&stored_path),
         used_fallback: false,
     })
+}
+
+/// The link written into the document for an asset stored at the workspace root.
+///
+/// A workspace keeps one `.assets` directory, at the root, but loading resolves
+/// a relative link against the directory of the file that names it. A document
+/// in a subdirectory therefore has to climb back out to the root, or the link
+/// it was handed points at a directory that does not exist.
+fn workspace_asset_markdown_path(
+    root: &Path,
+    document_dir: Option<&Path>,
+    filename: &str,
+) -> Result<String, WorkspaceError> {
+    let depth = match document_dir {
+        Some(document_dir) => document_dir
+            .strip_prefix(root)
+            .map_err(|_| {
+                WorkspaceError::new(
+                    "outside_workspace",
+                    "current file path is outside the workspace root",
+                )
+            })?
+            .components()
+            .count(),
+        None => 0,
+    };
+
+    let mut markdown_path = String::new();
+    for _ in 0..depth {
+        markdown_path.push_str("../");
+    }
+    markdown_path.push_str(".assets/");
+    markdown_path.push_str(filename);
+
+    Ok(markdown_path)
 }
 
 fn save_document_sibling_asset(
@@ -477,31 +519,7 @@ fn resolve_image_candidate(
     })?;
 
     let current_dir = if let Some(root) = root {
-        let current_path = Path::new(current_file_path);
-        let current_path = if current_path.is_absolute() {
-            current_path.to_path_buf()
-        } else {
-            root.join(current_path)
-        };
-        let current_dir = current_path.parent().ok_or_else(|| {
-            WorkspaceError::new("outside_workspace", "current file path has no parent")
-        })?;
-        let current_dir = fs::canonicalize(current_dir).map_err(|error| {
-            WorkspaceError::from_io(
-                "outside_workspace",
-                "failed to resolve current file directory",
-                &error,
-            )
-        })?;
-
-        if !current_dir.starts_with(root) {
-            return Err(WorkspaceError::new(
-                "outside_workspace",
-                "current file path is outside the workspace root",
-            ));
-        }
-
-        current_dir
+        canonical_workspace_document_dir(root, current_file_path)?
     } else {
         canonical_document_asset_parent(Some(current_file_path))?
     };
@@ -516,6 +534,41 @@ fn resolve_image_candidate(
     }
 
     Ok(candidate)
+}
+
+/// The directory a relative asset link in a workspace document resolves against.
+///
+/// Saving and loading an asset both need this, and they need the same answer:
+/// the whole point of the link is that the two agree on where it points.
+fn canonical_workspace_document_dir(
+    root: &Path,
+    current_file_path: &str,
+) -> Result<PathBuf, WorkspaceError> {
+    let current_path = Path::new(current_file_path);
+    let current_path = if current_path.is_absolute() {
+        current_path.to_path_buf()
+    } else {
+        root.join(current_path)
+    };
+    let current_dir = current_path.parent().ok_or_else(|| {
+        WorkspaceError::new("outside_workspace", "current file path has no parent")
+    })?;
+    let current_dir = fs::canonicalize(current_dir).map_err(|error| {
+        WorkspaceError::from_io(
+            "outside_workspace",
+            "failed to resolve current file directory",
+            &error,
+        )
+    })?;
+
+    if !current_dir.starts_with(root) {
+        return Err(WorkspaceError::new(
+            "outside_workspace",
+            "current file path is outside the workspace root",
+        ));
+    }
+
+    Ok(current_dir)
 }
 
 fn canonical_document_asset_parent(
