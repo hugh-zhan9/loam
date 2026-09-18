@@ -468,7 +468,7 @@ describe("MemoryPanel", () => {
     await flush();
 
     expect(host.querySelector("svg")).not.toBeNull();
-    expect(host.textContent).toContain("实线 = 有人断言");
+    expect(host.textContent).toContain("实线：归属 / 引用");
   });
 
   it("says the graph is empty rather than drawing an empty canvas", async () => {
