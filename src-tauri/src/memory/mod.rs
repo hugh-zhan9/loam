@@ -19,11 +19,10 @@ pub mod engine;
 pub mod evidence;
 pub mod import_legacy;
 pub mod knowledge;
+pub mod lark_export;
 pub mod models;
 pub mod retrieval;
 pub mod wiki_promote;
-
-
 
 #[cfg(test)]
 mod engine_tests;

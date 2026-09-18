@@ -21,10 +21,12 @@ use mempal_runtime::core::{anchor, utils::current_timestamp};
 use mempal_runtime::embed::Embedder;
 use mempal_runtime::ingest::lock::acquire_source_lock;
 use mempal_runtime::ingest::normalize::CURRENT_NORMALIZE_VERSION;
-use mempal_runtime::ingest::{ingest_dir_with_options, ingest_file_with_options, IngestOptions};
+use mempal_runtime::ingest::{ingest_file_with_options, IngestOptions};
+use mempal_runtime::path_filter::{project_walk, ProjectPathFilterOptions};
 
 use crate::memory::config::memory_home_dir;
 use crate::memory::engine::{block_on, embed_one};
+use crate::memory::lark_export::LarkDocument;
 use crate::memory::models::evidence::{IngestOutcome, WrittenEvidence};
 use crate::models::WorkspaceError;
 
@@ -105,12 +107,14 @@ pub fn write_text<E: Embedder + ?Sized>(
         )
     })?;
     if inserted {
-        database.insert_vector(&drawer_id, &vector).map_err(|error| {
-            WorkspaceError::new(
-                "memory_unavailable",
-                format!("failed to index material: {error}"),
-            )
-        })?;
+        database
+            .insert_vector(&drawer_id, &vector)
+            .map_err(|error| {
+                WorkspaceError::new(
+                    "memory_unavailable",
+                    format!("failed to index material: {error}"),
+                )
+            })?;
     }
 
     drop(guard);
@@ -124,8 +128,8 @@ pub fn write_text<E: Embedder + ?Sized>(
 
 /// Reads one file into the library.
 ///
-/// Upstream owns format detection, transcript noise stripping and chunking, so
-/// this defers to it rather than re-deriving any of that. The anchor it writes
+/// Lark export envelopes are decoded here; upstream still owns transcript
+/// detection, noise stripping, chunking and indexing. The anchor it writes
 /// is the legacy repo anchor — see the module note in the detailed design; the
 /// context assembler still reaches those drawers through its legacy fallback.
 pub fn ingest_file<E: Embedder + ?Sized>(
@@ -141,14 +145,26 @@ pub fn ingest_file<E: Embedder + ?Sized>(
     let room = room_override
         .map(ToString::to_string)
         .unwrap_or_else(|| room_for(workspace_root, path));
+    let source = path
+        .strip_prefix(workspace_root)
+        .ok()
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .or_else(|| path.file_name().map(std::path::PathBuf::from))
+        .unwrap_or_else(|| path.to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/");
+    let prepared = prepare_lark_file(path)?;
+    let input = prepared.as_ref().map_or(path, |file| file.path());
     let stats = block_on(ingest_file_with_options(
         database,
         embedder,
-        path,
+        input,
         wing,
         IngestOptions {
             room: Some(&room),
             source_root: Some(workspace_root),
+            source_file_override: Some(&source),
             ..default_ingest_options()
         },
     ))
@@ -176,30 +192,94 @@ pub fn ingest_directory<E: Embedder + ?Sized>(
     directory: &Path,
 ) -> Result<IngestOutcome, WorkspaceError> {
     let room = room_for(workspace_root, directory);
-    let stats = block_on(ingest_dir_with_options(
-        database,
-        embedder,
-        directory,
-        wing,
-        IngestOptions {
-            room: Some(&room),
-            source_root: Some(workspace_root),
-            ..default_ingest_options()
-        },
-    ))
-    .map_err(|error| {
-        WorkspaceError::new(
-            "memory_unavailable",
-            format!("failed to read {} into memory: {error}", directory.display()),
-        )
-    })?;
-
-    Ok(IngestOutcome {
-        files: stats.files,
-        chunks: stats.chunks,
-        skipped: stats.skipped,
+    let mut outcome = IngestOutcome {
+        files: 0,
+        chunks: 0,
+        skipped: 0,
         room,
-    })
+    };
+    let walk = project_walk(directory, &ProjectPathFilterOptions::default())
+        .map_err(|e| WorkspaceError::new("memory_unavailable", e.to_string()))?;
+    for entry in walk {
+        let entry = entry.map_err(|e| WorkspaceError::new("memory_unavailable", e.to_string()))?;
+        let path = entry.path();
+        if path == directory || !path.is_file() {
+            continue;
+        }
+        if skip_ingest_file(path) {
+            outcome.skipped += 1;
+            continue;
+        }
+        let file = ingest_file(
+            database,
+            embedder,
+            workspace_root,
+            wing,
+            path,
+            Some(&outcome.room),
+        )?;
+        outcome.files += file.files;
+        outcome.chunks += file.chunks;
+        outcome.skipped += file.skipped;
+    }
+    Ok(outcome)
+}
+
+fn prepare_lark_file(path: &Path) -> Result<Option<tempfile::NamedTempFile>, WorkspaceError> {
+    if !path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+    {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|e| WorkspaceError::from_io("memory_unavailable", "failed to read export", &e))?;
+    let source = String::from_utf8_lossy(&bytes);
+    let Some(document) = LarkDocument::parse(&source)
+        .map_err(|e| WorkspaceError::new("invalid_evidence", format!("{}: {e}", path.display())))?
+    else {
+        return Ok(None);
+    };
+    let file = tempfile::NamedTempFile::new().map_err(|e| {
+        WorkspaceError::from_io("memory_unavailable", "failed to prepare export text", &e)
+    })?;
+    std::fs::write(file.path(), document.readable()).map_err(|e| {
+        WorkspaceError::from_io("memory_unavailable", "failed to prepare export text", &e)
+    })?;
+    Ok(Some(file))
+}
+
+// mempal-runtime 0.9 does not expose its file filter or an input-transform hook.
+// Keep its exclusions while routing every eligible file through our normalizer.
+fn skip_ingest_file(path: &Path) -> bool {
+    let name = path.file_name().and_then(|v| v.to_str()).unwrap_or("");
+    matches!(name, ".DS_Store" | ".gitignore" | ".mempalignore")
+        || name.starts_with("._")
+        || path
+            .extension()
+            .and_then(|v| v.to_str())
+            .is_some_and(|extension| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "a" | "bmp"
+                        | "class"
+                        | "dll"
+                        | "dylib"
+                        | "exe"
+                        | "gif"
+                        | "ico"
+                        | "jar"
+                        | "jpeg"
+                        | "jpg"
+                        | "o"
+                        | "pdf"
+                        | "png"
+                        | "so"
+                        | "wasm"
+                        | "webp"
+                        | "zip"
+                )
+            })
 }
 
 /// Hides one entry from every read path, keeping it for an audit.
@@ -238,7 +318,9 @@ pub fn room_for(workspace_root: &Path, path: &Path) -> String {
     let mut segments = relative.components();
 
     match segments.next() {
-        Some(first) if relative.components().count() > 1 => sanitize_room(&first.as_os_str().to_string_lossy()),
+        Some(first) if relative.components().count() > 1 => {
+            sanitize_room(&first.as_os_str().to_string_lossy())
+        }
         Some(first) if path.is_dir() => sanitize_room(&first.as_os_str().to_string_lossy()),
         _ => "root".to_string(),
     }
@@ -291,19 +373,17 @@ fn default_ingest_options<'a>() -> IngestOptions<'a> {
 /// makes. Material we assemble ourselves gets the real worktree anchor instead,
 /// so the library can answer "where does this project live" — without at least
 /// one such drawer, a project reports no path at all.
-fn evidence_drawer(
-    drawer_id: &str,
-    evidence: &TextEvidence<'_>,
-) -> Result<Drawer, WorkspaceError> {
-    let derived = anchor::derive_anchor_from_cwd(Some(evidence.workspace_root)).map_err(|error| {
-        WorkspaceError::new(
-            "memory_unavailable",
-            format!(
-                "failed to work out which project {} belongs to: {error}",
-                evidence.workspace_root.display()
-            ),
-        )
-    })?;
+fn evidence_drawer(drawer_id: &str, evidence: &TextEvidence<'_>) -> Result<Drawer, WorkspaceError> {
+    let derived =
+        anchor::derive_anchor_from_cwd(Some(evidence.workspace_root)).map_err(|error| {
+            WorkspaceError::new(
+                "memory_unavailable",
+                format!(
+                    "failed to work out which project {} belongs to: {error}",
+                    evidence.workspace_root.display()
+                ),
+            )
+        })?;
 
     let drawer = Drawer::new_bootstrap_evidence(BootstrapEvidenceArgs {
         id: drawer_id.to_string(),
@@ -457,9 +537,15 @@ mod tests {
             for result in &results {
                 assert!(result.is_ok(), "writer failed: {result:?}");
             }
-            let created = results.iter().filter(|result| {
-                result.as_ref().map(|written| written.created).unwrap_or(false)
-            }).count();
+            let created = results
+                .iter()
+                .filter(|result| {
+                    result
+                        .as_ref()
+                        .map(|written| written.created)
+                        .unwrap_or(false)
+                })
+                .count();
             assert_eq!(created, 1, "exactly one writer should have created it");
 
             let database = open_library_for_test();
@@ -563,9 +649,15 @@ mod tests {
             std::fs::write(&file, "# Decision\n\nWe chose the embedded subset.\n").expect("write");
             let database = open_library_for_test();
 
-            let outcome =
-                ingest_file(&database, &FixedEmbedder, workspace.path(), &wing, &file, None)
-                    .expect("ingest");
+            let outcome = ingest_file(
+                &database,
+                &FixedEmbedder,
+                workspace.path(),
+                &wing,
+                &file,
+                None,
+            )
+            .expect("ingest");
 
             assert_eq!(outcome.files, 1);
             assert!(outcome.chunks >= 1);
@@ -577,6 +669,96 @@ mod tests {
                 .next()
                 .expect("one drawer");
             assert!(content.contains("embedded subset"), "{content}");
+        });
+    }
+
+    #[test]
+    fn lark_exports_are_decoded_before_embedding_and_keep_their_source() {
+        with_scoped_home(|_home| {
+            let root = tempfile::tempdir().unwrap();
+            let database = open_library_for_test();
+            let file = root.path().join("export.json");
+            let raw = r#"{"ok":true,"data":{"doc_id":"doc-id","markdown":"标题\n\u003clark-table\u003e<lark-tr><lark-td>字段</lark-td><lark-td>值</lark-td></lark-tr></lark-table>"}}"#;
+            std::fs::write(&file, raw).unwrap();
+            let first =
+                ingest_file(&database, &FixedEmbedder, root.path(), "test", &file, None).unwrap();
+            let second =
+                ingest_file(&database, &FixedEmbedder, root.path(), "test", &file, None).unwrap();
+            assert_eq!(first.chunks, 1);
+            assert_eq!(second.chunks, 0);
+            let rows = database.all_active_drawers().unwrap();
+            assert_eq!(rows.len(), 1);
+            let item = database.get_drawer(&rows[0].0).unwrap().unwrap();
+            assert_eq!(item.source_file.as_deref(), Some("export.json"));
+            assert!(item.content.contains("| 字段 | 值 |"), "{}", item.content);
+            assert!(!item.content.contains("lark-"));
+            assert_eq!(std::fs::read_to_string(file).unwrap(), raw);
+        });
+    }
+
+    #[test]
+    fn directory_ingest_uses_the_same_normalizer_and_preserves_upstream_filters() {
+        with_scoped_home(|_home| {
+            let root = tempfile::tempdir().unwrap();
+            let database = open_library_for_test();
+            for (name, content) in [
+                (
+                    "export.json",
+                    r#"{"ok":true,"data":{"doc_id":"d","markdown":"正文\n第二行"}}"#,
+                ),
+                ("code.json", r#"{"path":"C:\\new"}"#),
+                (".gitignore", "ignored.json\n"),
+                (".mempalignore", "private.json\n"),
+                ("ignored.json", "ignored"),
+                ("private.json", "private"),
+                ("photo.png", "binary"),
+                ("._junk", "metadata"),
+            ] {
+                std::fs::write(root.path().join(name), content).unwrap();
+            }
+            let outcome =
+                ingest_directory(&database, &FixedEmbedder, root.path(), "test", root.path())
+                    .unwrap();
+            assert_eq!(outcome.files, 2);
+            let rows = database.all_active_drawers().unwrap();
+            assert_eq!(rows.len(), 2);
+            assert!(rows.iter().any(|(_, text)| text == "正文\n第二行"));
+            assert!(rows.iter().any(|(_, text)| text == r#"{"path":"C:\\new"}"#));
+            let other = tempfile::tempdir().unwrap();
+            let upstream = Database::open(&other.path().join("db")).unwrap();
+            let original = block_on(mempal_runtime::ingest::ingest_dir_with_options(
+                &upstream,
+                &FixedEmbedder,
+                root.path(),
+                "test",
+                default_ingest_options(),
+            ))
+            .unwrap();
+            assert_eq!(
+                (outcome.files, outcome.skipped),
+                (original.files, original.skipped)
+            );
+        });
+    }
+
+    #[test]
+    fn failed_lark_export_writes_nothing() {
+        with_scoped_home(|_home| {
+            let root = tempfile::tempdir().unwrap();
+            let database = open_library_for_test();
+            let file = root.path().join("failed.json");
+            std::fs::write(
+                &file,
+                r#"{"ok":false,"data":{"doc_id":"d","markdown":"error"}}"#,
+            )
+            .unwrap();
+            assert_eq!(
+                ingest_file(&database, &FixedEmbedder, root.path(), "test", &file, None)
+                    .unwrap_err()
+                    .error_code(),
+                "invalid_evidence"
+            );
+            assert!(database.all_active_drawers().unwrap().is_empty());
         });
     }
 

@@ -43,7 +43,7 @@ serde = { version = "1", features = ["derive"] }
 # `preserve_order`, because this app merges into JSON files people maintain by
 # hand — a settings file must come back with its keys where its owner left them,
 # not alphabetised.
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 serde_yaml_ng = "0.10.0"
 sha2 = "0.10"
 tauri = { version = "2.10.3", features = ["devtools"] }
