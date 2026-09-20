@@ -484,3 +484,23 @@ fn binding_from_a_destroyed_window_does_not_resurrect_it() {
     assert!(registry.open_workspace_roots().is_empty());
     assert!(!registry.has_workspace_windows());
 }
+
+/// Each workspace window is named for its folder.
+///
+/// Several windows all called "Loam" are one undifferentiated list in the Dock
+/// and in the window menu, which is no help when the point of the feature is
+/// having two open at once.
+#[test]
+fn a_workspace_window_is_named_for_its_folder() {
+    assert_eq!(
+        crate::workspace_window_title(Some(&PathBuf::from("/Users/me/notes"))),
+        "notes - Loam"
+    );
+    // A window that has not picked a folder yet keeps the plain name.
+    assert_eq!(crate::workspace_window_title(None), "Loam");
+    // A root with no file name component cannot contribute one either.
+    assert_eq!(
+        crate::workspace_window_title(Some(&PathBuf::from("/"))),
+        "Loam"
+    );
+}

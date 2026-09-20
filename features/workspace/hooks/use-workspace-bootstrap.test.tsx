@@ -26,8 +26,11 @@ const { invoke, openDialog } = vi.hoisted(() => ({
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: openDialog }));
+const setTitle = vi.hoisted(() => vi.fn(async () => {}));
+
 vi.mock("@tauri-apps/api/window", () => ({
     getCurrentWindow: () => ({
+        setTitle,
         setSize: vi.fn(async () => {}),
         innerSize: vi.fn(async () => ({ toLogical: () => ({ width: 1, height: 1 }) })),
         scaleFactor: vi.fn(async () => 1),
@@ -474,6 +477,39 @@ describe("a window with no workspace bound", () => {
         expect(invoke).toHaveBeenCalledWith("focus_workspace_root", {
             rootPath: "/tmp/notes",
         });
+        await act(async () => root.unmount());
+    });
+});
+
+describe("naming the window", () => {
+    it("names the window after the folder it opens", async () => {
+        // A window that picked its own folder, or switched to another one,
+        // still carries the name Rust gave it at build time.
+        invoke.mockImplementation(async (command: string, args?: unknown) => {
+            if (command === "load_app_state") return EMPTY_APP_STATE;
+            if (command === "scan_workspace") {
+                const { rootPath } = args as { rootPath: string };
+                return {
+                    rootPath,
+                    nodes: [],
+                    truncated: false,
+                    entryCount: 0,
+                    warnings: [],
+                };
+            }
+            if (command === "bind_workspace_root") {
+                return { bound: true, ownedByOtherWindow: false };
+            }
+            return undefined;
+        });
+
+        const { root, render } = renderHook(undefined, {
+            rootPath: "/Users/me/notes",
+            skippedRoots: [],
+        });
+        await act(async () => render());
+
+        expect(setTitle).toHaveBeenCalledWith("notes - Loam");
         await act(async () => root.unmount());
     });
 });

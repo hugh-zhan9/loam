@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::thread;
@@ -549,6 +549,10 @@ fn new_workspace_window_for_root_inner(
     route: &str,
     restoring: bool,
 ) -> tauri::Result<String> {
+    // Several workspace windows all called "Loam" are indistinguishable in the
+    // Dock's window list and in the window menu, so each one is named for the
+    // folder it shows.
+    let root_for_title = root.clone();
     let claim = {
         let state = app.state::<Mutex<WindowSessionRegistry>>();
         let mut registry = state.lock().unwrap();
@@ -567,7 +571,7 @@ fn new_workspace_window_for_root_inner(
     };
 
     let builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::App(route.into()))
-        .title("Loam")
+        .title(workspace_window_title(root_for_title.as_deref()))
         .inner_size(1480.0, 860.0)
         .min_inner_size(1100.0, 640.0)
         .resizable(true);
@@ -608,6 +612,15 @@ fn should_update_restore_list_on_destroy(
     other_workspace_windows_remain: bool,
 ) -> bool {
     was_workspace && other_workspace_windows_remain
+}
+
+/// Name a workspace window after its folder, matching how a document window is
+/// named after its file. A window with no workspace yet keeps the plain name.
+fn workspace_window_title(root: Option<&Path>) -> String {
+    root.and_then(|root| root.file_name())
+        .and_then(|name| name.to_str())
+        .map(|name| format!("{name} - Loam"))
+        .unwrap_or_else(|| "Loam".to_string())
 }
 
 fn next_workspace_window_label() -> String {

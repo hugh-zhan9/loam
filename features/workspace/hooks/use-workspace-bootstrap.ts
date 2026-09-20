@@ -27,6 +27,7 @@ import {
     isPathInsideRoot,
     normalizeWorkspacePath,
 } from "../lib/path";
+import { basename } from "../lib/workspace-save";
 import {
     DEFAULT_WINDOW_SIZE,
     normalizePersistedWindowSize,
@@ -160,6 +161,10 @@ export function useWorkspaceBootstrap(options: WorkspaceBootstrapOptions = {}) {
             appStateRef.current = result.appState;
             setWorkspace(result.workspace);
             setStatus("ready");
+            // Rust names a window when it builds it, but a window that picked
+            // its folder itself, or switched to another one, still carries the
+            // name it opened with.
+            await setWorkspaceWindowTitle(result.workspace.rootPath);
         } catch (error) {
             setWorkspace(null);
             setStatus("error");
@@ -868,6 +873,28 @@ async function bindWorkspaceRoot(rootPath: string) {
 async function scanWorkspace(rootPath: string, options: ScanWorkspaceOptions) {
     const { invoke } = await import("@tauri-apps/api/core");
     return invoke<ScanWorkspaceResult>("scan_workspace", { rootPath, options });
+}
+
+/**
+ * Name this window after the folder it shows.
+ *
+ * Several windows all called "Loam" cannot be told apart in the Dock's window
+ * list or the window menu. Matches how a document window is named after its
+ * file.
+ */
+async function setWorkspaceWindowTitle(rootPath: string | null) {
+    if (!isTauriRuntime()) {
+        return;
+    }
+
+    const name = rootPath ? basename(rootPath) : "";
+
+    try {
+        const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        await getCurrentWindow().setTitle(name ? `${name} - Loam` : "Loam");
+    } catch (error) {
+        console.warn("Failed to set the workspace window title.", error);
+    }
 }
 
 async function chooseWorkspaceRoot() {
