@@ -120,7 +120,8 @@ pub fn workspace_search_cancel(
     Ok(WorkspaceSearchCancelResult { cancelled: true })
 }
 
-pub fn workspace_search_sync(
+#[cfg(test)]
+pub(crate) fn workspace_search_sync(
     request: WorkspaceSearchRequest,
 ) -> Result<WorkspaceSearchResult, WorkspaceError> {
     let cancel_token = Arc::new(AtomicBool::new(false));
