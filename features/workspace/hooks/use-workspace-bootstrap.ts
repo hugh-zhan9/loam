@@ -41,6 +41,30 @@ import { stopListening } from "../../../common/lib/tauri-events";
 
 type BootstrapStatus = "loading" | "ready" | "empty" | "error";
 
+/** Where a folder the user picked should open. */
+export type WorkspaceOpenChoice = "current" | "new";
+
+export interface WorkspaceBootstrapOptions {
+    /**
+     * Ask the user which window a folder should open in, or null if they
+     * backed out. Injected rather than called here so this hook stays testable
+     * without a dialog in the DOM.
+     */
+    confirmOpenTarget?: (rootPath: string) => Promise<WorkspaceOpenChoice | null>;
+    /** The root this window was opened for, and what launch could not restore. */
+    session?: { rootPath: string | null; skippedRoots: string[] };
+}
+
+interface WorkspaceOpenTarget {
+    canonicalPath: string;
+    existing: "current" | "other" | null;
+}
+
+interface BindWorkspaceRootResult {
+    bound: boolean;
+    ownedByOtherWindow: boolean;
+}
+
 interface ScanWorkspaceResult {
     rootPath: string;
     nodes: FileTreeNode[];
@@ -67,7 +91,11 @@ const DEFAULT_PANEL_STATE: WorkspacePanelState = {
     rightWidth: 300,
 };
 
-export function useWorkspaceBootstrap() {
+export function useWorkspaceBootstrap(options: WorkspaceBootstrapOptions = {}) {
+    // Read through a ref: both are called from callbacks and effects that must
+    // not be rebuilt when the caller passes a new closure.
+    const optionsRef = useRef(options);
+    optionsRef.current = options;
     const [status, setStatus] = useState<BootstrapStatus>("loading");
     const [workspace, setWorkspace] = useState<WorkspaceState | null>(null);
     const [message, setMessage] = useState<string | null>(null);
@@ -79,6 +107,7 @@ export function useWorkspaceBootstrap() {
     const workspaceRef = useRef<WorkspaceState | null>(null);
     const openWorkspaceRef =
         useRef<(rootPath: string) => Promise<void>>(async () => {});
+    const chooseWorkspaceRef = useRef<() => Promise<void>>(async () => {});
     const preferenceRefreshSequenceRef = useRef(0);
     const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const windowResizeSaveTimerRef =
@@ -109,6 +138,25 @@ export function useWorkspaceBootstrap() {
                 normalizedRootPath,
                 appStateRef.current,
             );
+            // Claim the root before showing it. Another window can take it
+            // between the duplicate check and here, and a window that shows a
+            // root it does not own is invisible to the registry: it is left
+            // out of the restore list and its window size is written into the
+            // owning window's entry.
+            const bound = await bindWorkspaceRoot(normalizedRootPath);
+            if (bound && !bound.bound) {
+                if (bound.ownedByOtherWindow) {
+                    await focusWorkspaceRoot(normalizedRootPath);
+                    setWorkspace(null);
+                    setStatus("empty");
+                    setMessage(
+                        "这个文件夹已经在另一个窗口打开了。",
+                    );
+                }
+
+                return;
+            }
+
             appStateRef.current = result.appState;
             setWorkspace(result.workspace);
             setStatus("ready");
@@ -139,7 +187,36 @@ export function useWorkspaceBootstrap() {
                 return;
             }
 
-            await openWorkspace(selectedRoot);
+            const target = await resolveWorkspaceOpenTarget(selectedRoot);
+
+            // A folder that is already open has no good answer to
+            // "current window or new window", so it is never asked: a new
+            // window would duplicate it, and the current one would leave two
+            // windows on one root.
+            if (target.existing === "current") {
+                return;
+            }
+
+            if (target.existing === "other") {
+                await focusWorkspaceRoot(target.canonicalPath);
+                return;
+            }
+
+            const confirm = optionsRef.current.confirmOpenTarget;
+            const choice = confirm
+                ? await confirm(target.canonicalPath)
+                : "current";
+
+            if (choice === null) {
+                return;
+            }
+
+            if (choice === "new") {
+                await openWorkspaceInNewWindow(target.canonicalPath);
+                return;
+            }
+
+            await openWorkspace(target.canonicalPath);
         } catch (error) {
             setStatus(workspace ? "ready" : "error");
             setMessage(formatError(error, "选择工作区失败。"));
@@ -149,6 +226,10 @@ export function useWorkspaceBootstrap() {
     useEffect(() => {
         openWorkspaceRef.current = openWorkspace;
     }, [openWorkspace]);
+
+    useEffect(() => {
+        chooseWorkspaceRef.current = chooseWorkspace;
+    }, [chooseWorkspace]);
 
     useEffect(() => {
         let cancelled = false;
@@ -178,7 +259,12 @@ export function useWorkspaceBootstrap() {
                 }
 
                 windowSizePersistenceReadyRef.current = false;
-                await restoreTauriWindowSize(appState.windowSize);
+                await restoreTauriWindowSize(
+                    windowSizeForRoot(
+                        appState,
+                        optionsRef.current.session?.rootPath ?? null,
+                    ),
+                );
 
                 if (cancelled) {
                     return;
@@ -188,6 +274,24 @@ export function useWorkspaceBootstrap() {
                 appStateRef.current = appState;
                 setPreferences(appState.preferences);
 
+                // A window opened for a specific root must open that one. It
+                // comes before recentWorkspaceRoot, or a restore of several
+                // windows would point every one of them at the same folder.
+                const assignedRoot = optionsRef.current.session?.rootPath;
+                if (assignedRoot) {
+                    await openWorkspaceRef.current(assignedRoot);
+                    return;
+                }
+
+                // This window exists to run the folder picker; opening the
+                // recent workspace first would scan and bind a workspace the
+                // user is about to be asked to replace.
+                if (startupActionIsOpenFolder()) {
+                    setStatus("empty");
+                    setMessage(null);
+                    return;
+                }
+
                 if (appStateRef.current.recentWorkspaceRoot) {
                     await openWorkspaceRef.current(
                         appStateRef.current.recentWorkspaceRoot,
@@ -195,19 +299,11 @@ export function useWorkspaceBootstrap() {
                     return;
                 }
 
-                const selectedRoot = await chooseWorkspaceRoot();
-
-                if (cancelled) {
-                    return;
-                }
-
-                if (selectedRoot) {
-                    await openWorkspaceRef.current(selectedRoot);
-                    return;
-                }
-
-                setStatus("empty");
-                setMessage("请选择一个文件夹以打开工作区。");
+                // Through chooseWorkspace, not openWorkspace: other windows
+                // may already be up (a CLI `new`, or a document window opening
+                // one), and this is the last folder-open path that would
+                // otherwise skip the duplicate check.
+                await chooseWorkspaceRef.current();
             } catch (error) {
                 if (cancelled) {
                     return;
@@ -241,13 +337,12 @@ export function useWorkspaceBootstrap() {
         }
 
         saveTimerRef.current = setTimeout(() => {
-            const nextAppState = upsertWorkspaceState(
+            const persisted = toPersistedWorkspace(workspace);
+            appStateRef.current = upsertWorkspaceState(
                 appStateRef.current,
-                workspace,
-                appStateRef.current.windowSize,
+                persisted,
             );
-            appStateRef.current = nextAppState;
-            void saveAppState(nextAppState).catch((error) => {
+            void saveWorkspaceState(persisted).catch((error) => {
                 setMessage(formatError(error, "保存应用状态失败。"));
             });
             saveTimerRef.current = null;
@@ -277,13 +372,13 @@ export function useWorkspaceBootstrap() {
         };
 
         const persistWindowSize = (windowSize: PersistedWindowSize) => {
-            const nextAppState = withWindowSize(
+            const rootPath = workspaceRef.current?.rootPath ?? null;
+            appStateRef.current = withWindowSize(
                 appStateRef.current,
-                workspaceRef.current,
+                rootPath,
                 windowSize,
             );
-            appStateRef.current = nextAppState;
-            void saveAppState(nextAppState).catch((error) => {
+            void saveWindowSize(rootPath, windowSize).catch((error) => {
                 setMessage(formatError(error, "保存应用状态失败。"));
             });
         };
@@ -302,9 +397,16 @@ export function useWorkspaceBootstrap() {
 
         const onBrowserResize = () => {
             scheduleWindowSizeSave(
-                getCurrentWindowSize(appStateRef.current.windowSize),
+                getCurrentWindowSize(currentWindowSizeFallback()),
             );
         };
+
+        function currentWindowSizeFallback() {
+            return windowSizeForRoot(
+                appStateRef.current,
+                workspaceRef.current?.rootPath ?? null,
+            );
+        }
 
         async function subscribeToWindowResize() {
             try {
@@ -376,13 +478,16 @@ export function useWorkspaceBootstrap() {
             windowResizeSaveTimerRef.current = null;
         }
 
-        const nextAppState = withWindowSize(
-            appStateRef.current,
-            workspaceRef.current,
-            await getCurrentTauriWindowSize(appStateRef.current.windowSize),
+        const rootPath = workspaceRef.current?.rootPath ?? null;
+        const windowSize = await getCurrentTauriWindowSize(
+            windowSizeForRoot(appStateRef.current, rootPath),
         );
-        appStateRef.current = nextAppState;
-        await saveAppState(nextAppState);
+        appStateRef.current = withWindowSize(
+            appStateRef.current,
+            rootPath,
+            windowSize,
+        );
+        await saveWindowSize(rootPath, windowSize);
     }, [isTauri]);
 
     return useMemo(
@@ -409,13 +514,12 @@ export function useWorkspaceBootstrap() {
                     return;
                 }
 
-                const nextAppState = {
+                appStateRef.current = {
                     ...appStateRef.current,
                     preferences: normalizedPreferences,
                 };
-                appStateRef.current = nextAppState;
                 setPreferences(normalizedPreferences);
-                await saveAppState(nextAppState);
+                await saveAppPreferences(normalizedPreferences);
 
                 const currentWorkspace = workspaceRef.current;
                 if (currentWorkspace) {
@@ -475,15 +579,9 @@ async function bootstrapWorkspace(
         persistedWorkspace,
         normalizedScan,
     );
-    const nextAppState = upsertWorkspaceState(
-        appState,
-        workspace,
-        appState.windowSize,
-    );
-
     return {
         workspace,
-        appState: nextAppState,
+        appState: upsertWorkspaceState(appState, toPersistedWorkspace(workspace)),
     };
 }
 
@@ -593,46 +691,94 @@ function collectFilePaths(nodes: FileTreeNode[]) {
     return paths;
 }
 
+/**
+ * Update this window's read cache of the app state.
+ *
+ * The cache only mirrors what this window itself wrote; the file on disk is
+ * merged by Rust, which is the only writer that sees every window.
+ */
 function upsertWorkspaceState(
     appState: PersistedAppState,
-    workspace: WorkspaceState,
-    windowSize: PersistedWindowSize,
+    persistedWorkspace: PersistedWorkspaceState,
 ): PersistedAppState {
-    const persistedWorkspace = toPersistedWorkspace(workspace);
+    const rootPath = normalizeWorkspacePath(persistedWorkspace.rootPath);
+    const existing = appState.workspaces.find(
+        (candidate) => normalizeWorkspacePath(candidate.rootPath) === rootPath,
+    );
     const otherWorkspaces = appState.workspaces.filter(
-        (candidate) =>
-            normalizeWorkspacePath(candidate.rootPath) !== workspace.rootPath,
+        (candidate) => normalizeWorkspacePath(candidate.rootPath) !== rootPath,
     );
 
     return {
+        ...appState,
         stateVersion: appState.stateVersion || STATE_VERSION,
-        recentWorkspaceRoot: workspace.rootPath,
-        preferences: appState.preferences,
-        workspaces: [persistedWorkspace, ...otherWorkspaces],
-        windowSize,
+        recentWorkspaceRoot: rootPath,
+        workspaces: [
+            {
+                ...persistedWorkspace,
+                // A tab save carries no size; keep whatever this root had.
+                windowSize:
+                    persistedWorkspace.windowSize ?? existing?.windowSize,
+            },
+            ...otherWorkspaces,
+        ],
     };
 }
 
 function withWindowSize(
     appState: PersistedAppState,
-    workspace: WorkspaceState | null,
+    rootPath: string | null,
     windowSize: PersistedWindowSize,
 ): PersistedAppState {
     const normalizedWindowSize = normalizePersistedWindowSize(windowSize);
 
-    if (workspace) {
-        return upsertWorkspaceState(
-            appState,
-            workspace,
-            normalizedWindowSize,
-        );
+    if (!rootPath) {
+        return {
+            ...appState,
+            stateVersion: appState.stateVersion || STATE_VERSION,
+            windowSize: normalizedWindowSize,
+        };
     }
 
-    return {
-        ...appState,
-        stateVersion: appState.stateVersion || STATE_VERSION,
+    const normalizedRootPath = normalizeWorkspacePath(rootPath);
+    const existing = appState.workspaces.find(
+        (candidate) =>
+            normalizeWorkspacePath(candidate.rootPath) === normalizedRootPath,
+    );
+
+    return upsertWorkspaceState(appState, {
+        ...(existing ?? {
+            rootPath: normalizedRootPath,
+            tabs: [],
+            activeTabId: null,
+            panels: DEFAULT_PANEL_STATE,
+            treeFocusPath: null,
+        }),
         windowSize: normalizedWindowSize,
-    };
+    });
+}
+
+/**
+ * The size a window showing `rootPath` should open at.
+ *
+ * Falls back to the top-level size for a root that has never been sized on its
+ * own, and for a window with no workspace yet.
+ */
+function windowSizeForRoot(
+    appState: PersistedAppState,
+    rootPath: string | null,
+): PersistedWindowSize {
+    if (!rootPath) {
+        return appState.windowSize;
+    }
+
+    const normalizedRootPath = normalizeWorkspacePath(rootPath);
+    const workspace = appState.workspaces.find(
+        (candidate) =>
+            normalizeWorkspacePath(candidate.rootPath) === normalizedRootPath,
+    );
+
+    return workspace?.windowSize ?? appState.windowSize;
 }
 
 function toPersistedWorkspace(
@@ -671,9 +817,52 @@ async function loadAppState() {
     return normalizeAppState(state);
 }
 
-async function saveAppState(state: PersistedAppState) {
+// Each writer submits only its own segment. Rust merges it into the file under
+// a lock, because a window sending the whole state would overwrite whatever
+// another window had saved since this one started.
+async function saveWorkspaceState(workspace: PersistedWorkspaceState) {
     const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("save_app_state", { state: normalizeAppState(state) });
+    await invoke("save_workspace_state", { workspace });
+}
+
+async function saveWindowSize(
+    rootPath: string | null,
+    windowSize: PersistedWindowSize,
+) {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("save_window_size", {
+        rootPath,
+        windowSize: normalizePersistedWindowSize(windowSize),
+    });
+}
+
+async function saveAppPreferences(preferences: AppPreferences) {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("save_app_preferences", { preferences });
+}
+
+async function resolveWorkspaceOpenTarget(rootPath: string) {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return invoke<WorkspaceOpenTarget>("workspace_open_target", { rootPath });
+}
+
+async function focusWorkspaceRoot(rootPath: string) {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("focus_workspace_root", { rootPath });
+}
+
+async function openWorkspaceInNewWindow(rootPath: string) {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("open_workspace_in_new_window", { rootPath });
+}
+
+async function bindWorkspaceRoot(rootPath: string) {
+    if (!isTauriRuntime()) {
+        return null;
+    }
+
+    const { invoke } = await import("@tauri-apps/api/core");
+    return invoke<BindWorkspaceRootResult>("bind_workspace_root", { rootPath });
 }
 
 async function scanWorkspace(rootPath: string, options: ScanWorkspaceOptions) {
@@ -775,9 +964,18 @@ function normalizeAppState(state: PersistedAppState | null): PersistedAppState {
                       treeFocusPath: workspace.treeFocusPath
                           ? normalizeWorkspacePath(workspace.treeFocusPath)
                           : null,
+                      // Absent until this root's window has been resized.
+                      windowSize: workspace.windowSize
+                          ? normalizePersistedWindowSize(workspace.windowSize)
+                          : undefined,
                   }))
             : [],
         windowSize: normalizePersistedWindowSize(state.windowSize),
+        openWorkspaceRoots: Array.isArray(state.openWorkspaceRoots)
+            ? state.openWorkspaceRoots
+                  .filter((root) => typeof root === "string" && root)
+                  .map((root) => normalizeWorkspacePath(root))
+            : [],
     };
 }
 
@@ -788,6 +986,7 @@ function createDefaultAppState(): PersistedAppState {
         preferences: createDefaultAppPreferences(),
         workspaces: [],
         windowSize: DEFAULT_WINDOW_SIZE,
+        openWorkspaceRoots: [],
     };
 }
 
@@ -855,6 +1054,23 @@ function getCurrentWindowSize(fallback: PersistedWindowSize) {
         width: window.innerWidth || fallback.width,
         height: window.innerHeight || fallback.height,
     });
+}
+
+/**
+ * Whether this window was built to run the folder picker.
+ *
+ * The picker itself is started by the component that owns the dialog; this
+ * only stops the bootstrap from opening something else first.
+ */
+function startupActionIsOpenFolder() {
+    if (typeof window === "undefined" || !window.location.search) {
+        return false;
+    }
+
+    return (
+        new URLSearchParams(window.location.search).get("workspaceAction") ===
+        "openFolder"
+    );
 }
 
 function isTauriRuntime() {

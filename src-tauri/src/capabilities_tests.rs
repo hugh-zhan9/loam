@@ -18,7 +18,7 @@ use glob::Pattern;
 use serde::Deserialize;
 
 use crate::window_sessions::{
-    DOCUMENT_ERROR_WINDOW_LABEL_PREFIX, DOCUMENT_WINDOW_LABEL_PREFIX, WORKSPACE_WINDOW_LABEL,
+    DOCUMENT_ERROR_WINDOW_LABEL_PREFIX, DOCUMENT_WINDOW_LABEL_PREFIX, WORKSPACE_WINDOW_LABEL_PREFIX,
 };
 
 #[derive(Deserialize)]
@@ -49,7 +49,8 @@ fn default_capability_covers_every_window_the_app_opens() {
     let capability = default_capability();
 
     for label in [
-        WORKSPACE_WINDOW_LABEL.to_string(),
+        format!("{WORKSPACE_WINDOW_LABEL_PREFIX}0"),
+        format!("{WORKSPACE_WINDOW_LABEL_PREFIX}17"),
         format!("{DOCUMENT_WINDOW_LABEL_PREFIX}0"),
         format!("{DOCUMENT_WINDOW_LABEL_PREFIX}17"),
         format!("{DOCUMENT_ERROR_WINDOW_LABEL_PREFIX}0"),

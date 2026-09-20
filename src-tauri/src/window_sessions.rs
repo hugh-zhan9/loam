@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 
 use tauri::Url;
 
-pub const WORKSPACE_WINDOW_LABEL: &str = "workspace-main";
 /// Every window label this app builds by counter, so one place says what the
 /// capability file has to cover.
+pub const WORKSPACE_WINDOW_LABEL_PREFIX: &str = "workspace-";
 pub const DOCUMENT_WINDOW_LABEL_PREFIX: &str = "document-";
 pub const DOCUMENT_ERROR_WINDOW_LABEL_PREFIX: &str = "document-error-";
 
@@ -17,7 +17,13 @@ pub enum WindowRole {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WindowSession {
-    Workspace,
+    Workspace {
+        /// The root this window was opened for, before its frontend has asked.
+        ///
+        /// None when nothing assigned one: a cold launch with nothing to
+        /// restore leaves the window to run the folder picker itself.
+        root_path: Option<String>,
+    },
     Document {
         file_name: String,
         display_path: String,
@@ -31,9 +37,42 @@ pub enum WindowSession {
 
 #[derive(Debug, Default)]
 pub struct WindowSessionRegistry {
-    workspace_window_label: Option<String>,
+    /// Kept in creation order: both the restore order and `openWorkspaceRoots`
+    /// are read off this, and a BTreeMap keyed by label would sort
+    /// `workspace-10` before `workspace-2`.
+    workspace_windows: Vec<WorkspaceWindowSession>,
+    last_focused_workspace: Option<String>,
+    /// Roots that could not be restored at launch, waiting for the first
+    /// workspace window to ask for its session so it can report them.
+    startup_skipped_roots: Vec<String>,
     document_windows: BTreeMap<PathBuf, DocumentWindowSession>,
     document_error_windows: BTreeMap<String, DocumentErrorWindowSession>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceWindowSession {
+    label: String,
+    /// Canonical root, or None until the window reports what it opened.
+    root: Option<PathBuf>,
+}
+
+/// What `claim_workspace_window` found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceWindowClaim {
+    /// That root is already open in this window; focus it instead of building
+    /// a second one.
+    Existing(String),
+    Created(String),
+}
+
+/// What `bind_workspace_root` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindOutcome {
+    Bound,
+    /// Another window took the root between the caller's check and this call.
+    AlreadyOwnedBy(String),
+    /// The window is gone — its close raced its own frontend's report.
+    UnknownWindow,
 }
 
 #[derive(Debug, Clone)]
@@ -49,14 +88,21 @@ struct DocumentErrorWindowSession {
     path: Option<PathBuf>,
 }
 
+/// Which files each workspace window is holding unsaved.
+///
+/// Bucketed per window because a document window asks this registry whether the
+/// workspace has unsaved edits to the file it is showing. One shared set would
+/// let the second workspace window's report erase the first one's, and the
+/// document window would then be told a dirty file is clean.
 #[derive(Debug, Default)]
 pub struct DirtyWorkspacePaths {
-    paths: BTreeSet<PathBuf>,
+    by_window: BTreeMap<String, BTreeSet<PathBuf>>,
 }
 
 impl DirtyWorkspacePaths {
-    pub fn update(&mut self, paths: Vec<String>) {
-        self.paths = paths
+    /// Replace what `label` is holding. Other windows keep their own.
+    pub fn update(&mut self, label: &str, paths: Vec<String>) {
+        let normalized: BTreeSet<PathBuf> = paths
             .into_iter()
             .filter_map(|path| {
                 if path.is_empty() {
@@ -67,23 +113,122 @@ impl DirtyWorkspacePaths {
                 Some(raw_path.canonicalize().unwrap_or(raw_path))
             })
             .collect();
+
+        if normalized.is_empty() {
+            self.by_window.remove(label);
+            return;
+        }
+
+        self.by_window.insert(label.to_string(), normalized);
     }
 
     pub fn contains(&self, path: &Path) -> bool {
         let normalized = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        self.paths.contains(&normalized)
+        self.by_window
+            .values()
+            .any(|paths| paths.contains(&normalized))
     }
 
-    pub fn clear(&mut self) {
-        self.paths.clear();
+    pub fn clear_window(&mut self, label: &str) {
+        self.by_window.remove(label);
     }
 }
 
 impl WindowSessionRegistry {
-    pub fn claim_workspace_window(&mut self) -> String {
-        self.workspace_window_label
-            .get_or_insert_with(|| WORKSPACE_WINDOW_LABEL.to_string())
-            .clone()
+    /// Reserve a window for `root`, or report the one already showing it.
+    ///
+    /// `root` must already be canonical; this does not touch the filesystem.
+    pub fn claim_workspace_window(
+        &mut self,
+        root: Option<PathBuf>,
+        requested_label: String,
+    ) -> WorkspaceWindowClaim {
+        if let Some(root) = root.as_deref() {
+            if let Some(label) = self.workspace_label_for_root(root) {
+                return WorkspaceWindowClaim::Existing(label.to_string());
+            }
+        }
+
+        self.workspace_windows.push(WorkspaceWindowSession {
+            label: requested_label.clone(),
+            root,
+        });
+        WorkspaceWindowClaim::Created(requested_label)
+    }
+
+    /// Record that `label` now shows `root`. Switching workspaces rebinds.
+    pub fn bind_workspace_root(&mut self, label: &str, root: PathBuf) -> BindOutcome {
+        if let Some(owner) = self.workspace_label_for_root(&root) {
+            if owner != label {
+                return BindOutcome::AlreadyOwnedBy(owner.to_string());
+            }
+        }
+
+        // Every workspace window claims before it is built, so an unknown
+        // label means this one has already been destroyed and its report is in
+        // flight. Re-adding it would leave a root bound to no window: it would
+        // stay in the restore list forever and answer "already open" to every
+        // later attempt to open that folder.
+        let Some(session) = self
+            .workspace_windows
+            .iter_mut()
+            .find(|session| session.label == label)
+        else {
+            return BindOutcome::UnknownWindow;
+        };
+
+        session.root = Some(root);
+        BindOutcome::Bound
+    }
+
+    pub fn workspace_label_for_root(&self, root: &Path) -> Option<&str> {
+        self.workspace_windows
+            .iter()
+            .find(|session| session.root.as_deref() == Some(root))
+            .map(|session| session.label.as_str())
+    }
+
+    /// The bound roots, in window creation order.
+    pub fn open_workspace_roots(&self) -> Vec<PathBuf> {
+        self.workspace_windows
+            .iter()
+            .filter_map(|session| session.root.clone())
+            .collect()
+    }
+
+    pub fn set_startup_skipped_roots(&mut self, roots: Vec<String>) {
+        self.startup_skipped_roots = roots;
+    }
+
+    /// Hand the skipped roots to the first caller; later windows get none.
+    pub fn take_startup_skipped_roots(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.startup_skipped_roots)
+    }
+
+    pub fn note_workspace_focus(&mut self, label: &str) {
+        if self
+            .workspace_windows
+            .iter()
+            .any(|session| session.label == label)
+        {
+            self.last_focused_workspace = Some(label.to_string());
+        }
+    }
+
+    /// The window an open-folder request from elsewhere should land in.
+    pub fn last_focused_workspace_label(&self) -> Option<&str> {
+        self.last_focused_workspace
+            .as_deref()
+            .filter(|label| {
+                self.workspace_windows
+                    .iter()
+                    .any(|session| session.label == *label)
+            })
+            .or_else(|| {
+                self.workspace_windows
+                    .first()
+                    .map(|session| session.label.as_str())
+            })
     }
 
     pub fn claim_document_window(
@@ -115,7 +260,11 @@ impl WindowSessionRegistry {
     }
 
     pub fn role_for_label(&self, label: &str) -> Option<WindowRole> {
-        if self.workspace_window_label.as_deref() == Some(label) {
+        if self
+            .workspace_windows
+            .iter()
+            .any(|session| session.label == label)
+        {
             return Some(WindowRole::Workspace);
         }
 
@@ -132,8 +281,14 @@ impl WindowSessionRegistry {
     }
 
     pub fn session_for_label(&self, label: &str) -> Option<WindowSession> {
-        if self.workspace_window_label.as_deref() == Some(label) {
-            return Some(WindowSession::Workspace);
+        if let Some(session) = self
+            .workspace_windows
+            .iter()
+            .find(|session| session.label == label)
+        {
+            return Some(WindowSession::Workspace {
+                root_path: session.root.as_deref().map(path_to_string),
+            });
         }
 
         if let Some(session) = self
@@ -162,12 +317,18 @@ impl WindowSessionRegistry {
     }
 
     pub fn remove_label(&mut self, label: &str) {
-        if self.workspace_window_label.as_deref() == Some(label) {
-            self.workspace_window_label = None;
+        self.workspace_windows
+            .retain(|session| session.label != label);
+        if self.last_focused_workspace.as_deref() == Some(label) {
+            self.last_focused_workspace = None;
         }
         self.document_windows
             .retain(|_, session| session.label != label);
         self.document_error_windows.remove(label);
+    }
+
+    pub fn has_workspace_windows(&self) -> bool {
+        !self.workspace_windows.is_empty()
     }
 
     pub fn has_document_windows(&self) -> bool {

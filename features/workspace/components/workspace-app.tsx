@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
 import { tauriCore, tauriWindow } from "@/common/lib/tauri";
 import { EmptyState, TextControlButton } from "../../../common/components/ui-controls";
@@ -26,16 +26,40 @@ import { SettingsButton } from "./settings-button";
 import { WorkspaceShell } from "./workspace-shell";
 import { stopListening } from "@/common/lib/tauri-events";
 
-export function WorkspaceApp() {
+export function WorkspaceApp({ session }: { session?: WorkspaceWindowSession }) {
     return (
         <AppDialogProvider>
-            <WorkspaceAppInner />
+            <WorkspaceAppInner session={session} />
         </AppDialogProvider>
     );
 }
 
-function WorkspaceAppInner() {
+/** The workspace half of the window session Rust hands this window. */
+interface WorkspaceWindowSession {
+    rootPath: string | null;
+    skippedRoots: string[];
+}
+
+function WorkspaceAppInner({ session }: { session?: WorkspaceWindowSession }) {
     const dialogs = useAppDialogs();
+
+    // Asked only for a folder no window has open; a folder already open is
+    // resolved before this runs.
+    const confirmOpenTarget = useCallback(
+        async (rootPath: string) => {
+            const choice = await dialogs.choice({
+                title: "在哪里打开这个文件夹？",
+                message: rootPath,
+                choices: [
+                    { label: "当前窗口", value: "current" },
+                    { label: "新窗口", value: "new" },
+                ],
+            });
+
+            return choice === "current" || choice === "new" ? choice : null;
+        },
+        [dialogs],
+    );
     const workspaceActionsRef = useRef<WorkspaceMenuActions | null>(null);
     const workspaceRef = useRef<WorkspaceState | null>(null);
     const {
@@ -48,7 +72,7 @@ function WorkspaceAppInner() {
         preferences,
         updatePreferences,
         persistCurrentWindowSize,
-    } = useWorkspaceBootstrap();
+    } = useWorkspaceBootstrap({ confirmOpenTarget, session });
     useEffect(() => {
         workspaceRef.current = workspace;
     }, [workspace]);
@@ -115,6 +139,7 @@ function WorkspaceAppInner() {
             data-mdx-root
             className="h-screen min-h-0 bg-base-100 text-base-content"
         >
+            <SkippedWorkspacesNotice roots={session?.skippedRoots ?? []} />
             {workspace ? (
                 <WorkspaceShell
                     workspace={workspace}
@@ -509,6 +534,43 @@ function formatError(error: unknown, fallback: string) {
     }
 
     return fallback;
+}
+
+/**
+ * What launch could not reopen.
+ *
+ * Shown once, in the first window to ask for its session, rather than as a
+ * dialog per folder: a missing volume should not stand between the user and
+ * the workspaces that did come back.
+ */
+function SkippedWorkspacesNotice({ roots }: { roots: string[] }) {
+    const [dismissed, setDismissed] = useState(false);
+
+    if (dismissed || roots.length === 0) {
+        return null;
+    }
+
+    return (
+        <div
+            role="status"
+            data-mdx-skipped-workspaces
+            className="flex items-start justify-between gap-3 border-b border-[var(--mdx-separator)] bg-base-200 px-3 py-2 text-xs text-base-content/80"
+        >
+            <div className="min-w-0">
+                <div>{`${roots.length} 个工作区未能恢复：`}</div>
+                <ul className="mt-1 space-y-0.5">
+                    {roots.map((root) => (
+                        <li key={root} className="truncate font-mono">
+                            {root}
+                        </li>
+                    ))}
+                </ul>
+            </div>
+            <TextControlButton onClick={() => setDismissed(true)}>
+                知道了
+            </TextControlButton>
+        </div>
+    );
 }
 
 function WorkspaceEmptyState({

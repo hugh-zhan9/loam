@@ -1,16 +1,18 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
+use serde::Serialize;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::{
     AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent, Wry,
 };
 use window_sessions::{
-    is_supported_document_path, normalize_opened_url_path, DirtyWorkspacePaths,
+    is_supported_document_path, normalize_opened_url_path, BindOutcome, DirtyWorkspacePaths,
     StartupOpenRoutingState, WindowRole, WindowSession, WindowSessionRegistry,
+    WorkspaceWindowClaim,
 };
 
 mod assets;
@@ -500,6 +502,11 @@ mod memory_tauri_command_tests {
 }
 
 static WIN_ID: AtomicU32 = AtomicU32::new(0);
+/// Set once launch has tried to reopen the previous session's workspaces.
+///
+/// Restoring is a launch-time decision and it forgets roots it cannot reach,
+/// so it must not run again from a Dock reopen later in the session.
+static WORKSPACES_RESTORED: AtomicBool = AtomicBool::new(false);
 const WORKSPACE_FRONTEND_HEARTBEAT_MAX_AGE: Duration = Duration::from_secs(45);
 const WORKSPACE_FRONTEND_RECOVERY_DELAY: Duration = Duration::from_secs(2);
 const WORKSPACE_FRONTEND_RECOVERY_MIN_INTERVAL: Duration = Duration::from_secs(60);
@@ -520,28 +527,119 @@ impl MenuState {
 }
 
 pub(crate) fn new_workspace_window(app: &AppHandle) -> tauri::Result<String> {
-    new_workspace_window_with_route(app, "/")
+    new_workspace_window_for_root(app, None, "/")
 }
 
-fn new_workspace_window_with_route(app: &AppHandle, route: &str) -> tauri::Result<String> {
-    let label = {
+/// Open a workspace window, or focus the one already showing `root`.
+///
+/// `root` must already be canonical. Passing None builds a window with no root
+/// assigned yet: its frontend picks one and reports back through
+/// `bind_workspace_root`.
+fn new_workspace_window_for_root(
+    app: &AppHandle,
+    root: Option<PathBuf>,
+    route: &str,
+) -> tauri::Result<String> {
+    new_workspace_window_for_root_inner(app, root, route, false)
+}
+
+fn new_workspace_window_for_root_inner(
+    app: &AppHandle,
+    root: Option<PathBuf>,
+    route: &str,
+    restoring: bool,
+) -> tauri::Result<String> {
+    let claim = {
         let state = app.state::<Mutex<WindowSessionRegistry>>();
         let mut registry = state.lock().unwrap();
-        registry.claim_workspace_window()
+        registry.claim_workspace_window(root, next_workspace_window_label())
     };
-    if let Some(window) = app.get_webview_window(&label) {
-        let _ = window.set_focus();
-        return Ok(label);
-    }
+
+    let label = match claim {
+        WorkspaceWindowClaim::Existing(label) => {
+            if let Some(window) = app.get_webview_window(&label) {
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+            return Ok(label);
+        }
+        WorkspaceWindowClaim::Created(label) => label,
+    };
 
     let builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::App(route.into()))
         .title("Loam")
         .inner_size(1480.0, 860.0)
         .min_inner_size(1100.0, 640.0)
         .resizable(true);
-    let window = window_appearance::configure_workspace_window(builder).build()?;
+    let window = match window_appearance::configure_workspace_window(builder).build() {
+        Ok(window) => window,
+        Err(error) => {
+            // The claim reserved a label and possibly a root; a window that
+            // never opened must not keep them, or that root can never be
+            // opened again.
+            let state = app.state::<Mutex<WindowSessionRegistry>>();
+            let mut registry = state.lock().unwrap();
+            registry.remove_label(&label);
+            return Err(error);
+        }
+    };
     let _ = window.set_focus();
+    if !restoring {
+        persist_open_workspace_roots(app);
+    }
     Ok(label)
+}
+
+/// Whether a destroyed window should rewrite the restore list.
+///
+/// Closing one of several workspace windows narrows the set the user wants
+/// back, so the list is rewritten. Closing the *last* one is how this app
+/// quits — the runtime exits once its window map empties — and rewriting the
+/// list then would store an empty one and restore nothing next launch.
+///
+/// This deliberately does not ask whether the app is shutting down. The
+/// runtime emits `Destroyed` for a window *before* it emits `ExitRequested`
+/// for the app (tauri-runtime-wry dispatches the window event, then checks
+/// whether the window map has become empty), so a shutdown flag set from
+/// `ExitRequested` is always still false here. A macOS Dock quit skips
+/// `Destroyed` altogether. Window count is the signal that actually works.
+fn should_update_restore_list_on_destroy(
+    was_workspace: bool,
+    other_workspace_windows_remain: bool,
+) -> bool {
+    was_workspace && other_workspace_windows_remain
+}
+
+fn next_workspace_window_label() -> String {
+    format!(
+        "{}{}",
+        window_sessions::WORKSPACE_WINDOW_LABEL_PREFIX,
+        WIN_ID.fetch_add(1, Ordering::SeqCst)
+    )
+}
+
+/// Write the registry's bound roots into state.json.
+///
+/// The registry is the only thing that knows every window's root, so it owns
+/// this field; no frontend submits it.
+fn persist_open_workspace_roots(app: &AppHandle) {
+    let roots = {
+        let state = app.state::<Mutex<WindowSessionRegistry>>();
+        let registry = state.lock().unwrap();
+        registry.open_workspace_roots()
+    };
+
+    if let Err(error) = state_store::set_open_workspace_roots(
+        roots
+            .iter()
+            .map(|root| root.to_string_lossy().into_owned())
+            .collect(),
+    ) {
+        log::warn!(
+            target: "mdx::window",
+            "failed to persist open workspace roots: {error:?}",
+        );
+    }
 }
 
 pub(crate) fn new_document_window(
@@ -631,9 +729,106 @@ fn encode_query_component(value: &str) -> String {
 }
 
 fn focus_or_create_initial_workspace_window(app: &AppHandle) {
+    // Already restored, or the user reopened the app with windows up: focus
+    // rather than build another.
+    let existing = {
+        let state = app.state::<Mutex<WindowSessionRegistry>>();
+        let registry = state.lock().unwrap();
+        registry.last_focused_workspace_label().map(str::to_string)
+    };
+
+    if let Some(window) = existing.and_then(|label| app.get_webview_window(&label)) {
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        return;
+    }
+
+    if restore_workspace_windows(app) {
+        return;
+    }
+
     if let Err(error) = new_workspace_window(app) {
         log::error!("failed to create workspace window: {error}");
     }
+}
+
+/// Reopen every workspace that was up when the app last ran.
+///
+/// Returns whether any window was opened. Runs at most once per process: it
+/// forgets roots it cannot reach, which is a launch-time decision, and a Dock
+/// reopen later in the session must not repeat that deletion.
+fn restore_workspace_windows(app: &AppHandle) -> bool {
+    if WORKSPACES_RESTORED.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+
+    let saved_roots = match state_store::load_app_state() {
+        Ok(state) => state.open_workspace_roots,
+        Err(error) => {
+            log::warn!(
+                target: "mdx::window",
+                "failed to read workspace roots to restore: {error:?}",
+            );
+            return false;
+        }
+    };
+
+    if saved_roots.is_empty() {
+        return false;
+    }
+
+    // Probe every root before building any window, so the notice is in place
+    // before the first window asks for its session, and so a root is only
+    // forgotten for being unreachable — never for a window that failed to
+    // build, which would delete the tabs of a folder that is perfectly fine.
+    let mut available: Vec<PathBuf> = Vec::new();
+    let mut unavailable: Vec<String> = Vec::new();
+
+    for root in saved_roots {
+        match canonicalize_workspace_root(&root) {
+            Ok(canonical) => available.push(canonical),
+            Err(_) => {
+                log::warn!(
+                    target: "mdx::window",
+                    "skipped unavailable workspace root={root}",
+                );
+                unavailable.push(root);
+            }
+        }
+    }
+
+    if !unavailable.is_empty() {
+        if let Err(error) = state_store::forget_workspace_roots(&unavailable) {
+            log::warn!(
+                target: "mdx::window",
+                "failed to forget unavailable workspace roots: {error:?}",
+            );
+        }
+
+        let state = app.state::<Mutex<WindowSessionRegistry>>();
+        let mut registry = state.lock().unwrap();
+        registry.set_startup_skipped_roots(unavailable);
+    }
+
+    let mut restored = 0usize;
+    for root in available {
+        match new_workspace_window_for_root_inner(app, Some(root.clone()), "/", true) {
+            Ok(_) => restored += 1,
+            // The folder is reachable; only this window failed. Leaving the
+            // root in the restore list gives the next launch another go.
+            Err(error) => log::error!(
+                target: "mdx::window",
+                "failed to restore workspace window root={} error={error}",
+                root.display(),
+            ),
+        }
+    }
+
+    if restored > 0 {
+        persist_open_workspace_roots(app);
+    }
+
+    restored > 0
 }
 
 #[tauri::command]
@@ -643,22 +838,27 @@ fn focus_or_create_workspace_window(app: AppHandle) -> Result<(), String> {
 }
 
 fn focus_or_create_workspace_window_and_open_folder(app: &AppHandle) -> tauri::Result<()> {
+    // With several workspace windows open, "the" workspace window is the one
+    // the user looked at last.
     let label = {
         let state = app.state::<Mutex<WindowSessionRegistry>>();
-        let mut registry = state.lock().unwrap();
-        registry.claim_workspace_window()
+        let registry = state.lock().unwrap();
+        registry.last_focused_workspace_label().map(str::to_string)
     };
 
-    if let Some(window) = app.get_webview_window(&label) {
-        let _ = window.set_focus();
-        // The workspace window's own label, not a broadcast: a document window
-        // reacts to this event by calling this very command, so broadcasting it
-        // hands that window back its own request, forever.
-        let _ = window.emit_to(&label, "mdx-menu-open-folder", ());
-        return Ok(());
+    if let Some(label) = label {
+        if let Some(window) = app.get_webview_window(&label) {
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+            // The workspace window's own label, not a broadcast: a document
+            // window reacts to this event by calling this very command, so
+            // broadcasting it hands that window back its own request, forever.
+            let _ = window.emit_to(&label, "mdx-menu-open-folder", ());
+            return Ok(());
+        }
     }
 
-    new_workspace_window_with_route(app, "/?workspaceAction=openFolder").map(|_| ())
+    new_workspace_window_for_root(app, None, "/?workspaceAction=openFolder").map(|_| ())
 }
 
 fn open_supported_document_urls(app: &AppHandle, urls: &[tauri::Url]) -> bool {
@@ -889,12 +1089,18 @@ fn get_window_session(
     state: tauri::State<'_, Mutex<WindowSessionRegistry>>,
     dirty_paths: tauri::State<'_, Mutex<DirtyWorkspacePaths>>,
 ) -> serde_json::Value {
-    let registry = state.lock().expect("window session registry poisoned");
+    let mut registry = state.lock().expect("window session registry poisoned");
     let dirty_paths = dirty_paths
         .lock()
         .expect("dirty workspace paths registry poisoned");
 
-    match registry.session_for_label(window.label()) {
+    let session = registry.session_for_label(window.label());
+    let skipped_roots = match session {
+        Some(WindowSession::Workspace { .. }) | None => registry.take_startup_skipped_roots(),
+        _ => Vec::new(),
+    };
+
+    match session {
         Some(WindowSession::Document {
             file_name,
             display_path,
@@ -911,21 +1117,169 @@ fn get_window_session(
             "message": message,
             "path": path,
         }),
-        Some(WindowSession::Workspace) | None => serde_json::json!({
+        Some(WindowSession::Workspace { root_path }) => serde_json::json!({
             "kind": "workspace",
+            "rootPath": root_path,
+            "skippedRoots": skipped_roots,
+        }),
+        None => serde_json::json!({
+            "kind": "workspace",
+            "rootPath": serde_json::Value::Null,
+            "skippedRoots": skipped_roots,
         }),
     }
 }
 
 #[tauri::command]
 fn update_workspace_dirty_paths(
+    window: tauri::Window,
     paths: Vec<String>,
     dirty_paths: tauri::State<'_, Mutex<DirtyWorkspacePaths>>,
 ) {
     let mut dirty_paths = dirty_paths
         .lock()
         .expect("dirty workspace paths registry poisoned");
-    dirty_paths.update(paths);
+    dirty_paths.update(window.label(), paths);
+}
+
+/// Where a chosen folder should open: nowhere yet, here, or another window.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceOpenTarget {
+    canonical_path: String,
+    /// "current", "other", or null when no window has it open.
+    existing: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BindWorkspaceRootResult {
+    bound: bool,
+    owned_by_other_window: bool,
+}
+
+/// Resolve a chosen folder against the windows already open. Pure query.
+///
+/// Runs before the current-window/new-window prompt, because a folder that is
+/// already open has no good answer to that question: a new window would
+/// duplicate it, and the current window would leave two windows on one root.
+#[tauri::command]
+fn workspace_open_target(
+    window: tauri::Window,
+    root_path: String,
+    state: tauri::State<'_, Mutex<WindowSessionRegistry>>,
+) -> Result<WorkspaceOpenTarget, models::WorkspaceError> {
+    let canonical = canonicalize_workspace_root(&root_path)?;
+    let registry = state.lock().expect("window session registry poisoned");
+
+    let existing = match registry.workspace_label_for_root(&canonical) {
+        Some(label) if label == window.label() => Some("current"),
+        Some(_) => Some("other"),
+        None => None,
+    };
+
+    Ok(WorkspaceOpenTarget {
+        canonical_path: canonical.to_string_lossy().into_owned(),
+        existing,
+    })
+}
+
+/// Focus whichever window already has this root open.
+///
+/// A root with no window is not an error: it may have been closed between the
+/// caller's check and this call.
+#[tauri::command]
+fn focus_workspace_root(
+    app: AppHandle,
+    root_path: String,
+    state: tauri::State<'_, Mutex<WindowSessionRegistry>>,
+) -> Result<(), models::WorkspaceError> {
+    let canonical = canonicalize_workspace_root(&root_path)?;
+    let label = {
+        let registry = state.lock().expect("window session registry poisoned");
+        registry
+            .workspace_label_for_root(&canonical)
+            .map(str::to_string)
+    };
+
+    if let Some(window) = label.and_then(|label| app.get_webview_window(&label)) {
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn open_workspace_in_new_window(
+    app: AppHandle,
+    root_path: String,
+) -> Result<(), models::WorkspaceError> {
+    let canonical = canonicalize_workspace_root(&root_path)?;
+
+    new_workspace_window_for_root(&app, Some(canonical), "/").map_err(|error| {
+        models::WorkspaceError::new(
+            "workspace_window_failed",
+            format!("failed to open workspace window: {error}"),
+        )
+    })?;
+
+    Ok(())
+}
+
+/// The calling window reports which root it now shows.
+#[tauri::command]
+fn bind_workspace_root(
+    app: AppHandle,
+    window: tauri::Window,
+    root_path: String,
+) -> Result<BindWorkspaceRootResult, models::WorkspaceError> {
+    let canonical = canonicalize_workspace_root(&root_path)?;
+    let outcome = {
+        let state = app.state::<Mutex<WindowSessionRegistry>>();
+        let mut registry = state.lock().expect("window session registry poisoned");
+        registry.bind_workspace_root(window.label(), canonical)
+    };
+
+    match outcome {
+        BindOutcome::Bound => {
+            persist_open_workspace_roots(&app);
+            Ok(BindWorkspaceRootResult {
+                bound: true,
+                owned_by_other_window: false,
+            })
+        }
+        BindOutcome::AlreadyOwnedBy(_) => Ok(BindWorkspaceRootResult {
+            bound: false,
+            owned_by_other_window: true,
+        }),
+        // The window closed while its own report was in flight. Nothing to
+        // record and nothing for the caller to do — it is already gone.
+        BindOutcome::UnknownWindow => Ok(BindWorkspaceRootResult {
+            bound: false,
+            owned_by_other_window: false,
+        }),
+    }
+}
+
+fn canonicalize_workspace_root(root_path: &str) -> Result<PathBuf, models::WorkspaceError> {
+    let path = PathBuf::from(root_path);
+    let canonical = path.canonicalize().map_err(|error| {
+        models::WorkspaceError::from_io(
+            "workspace_root_unavailable",
+            "failed to resolve the workspace folder",
+            &error,
+        )
+    })?;
+
+    if !canonical.is_dir() {
+        return Err(models::WorkspaceError::new(
+            "workspace_root_not_a_directory",
+            "the chosen path is not a folder",
+        ));
+    }
+
+    Ok(canonical)
 }
 
 #[tauri::command]
@@ -1074,7 +1428,13 @@ pub fn run() {
             cli_server::cli_frontend_heartbeat,
             cli_server::cli_update_tab_state,
             state_store::load_app_state,
-            state_store::save_app_state,
+            state_store::save_workspace_state,
+            state_store::save_window_size,
+            state_store::save_app_preferences,
+            workspace_open_target,
+            focus_workspace_root,
+            open_workspace_in_new_window,
+            bind_workspace_root,
             user_themes::list_user_themes,
             user_themes::save_user_theme,
             user_themes::reveal_user_themes_dir,
@@ -1245,6 +1605,11 @@ pub fn run() {
             } => {
                 update_menu_state_for_role(app, window_role_for_label(app, &label));
                 if window_role_for_label(app, &label) == Some(WindowRole::Workspace) {
+                    {
+                        let state = app.state::<Mutex<WindowSessionRegistry>>();
+                        let mut registry = state.lock().unwrap();
+                        registry.note_workspace_focus(&label);
+                    }
                     schedule_workspace_frontend_recovery_check(app, label, "focused");
                 }
             }
@@ -1261,17 +1626,23 @@ pub fn run() {
                     role,
                     app.webview_windows().len(),
                 );
-                let was_workspace = {
+                let (was_workspace, other_workspace_windows_remain) = {
                     let state = app.state::<Mutex<WindowSessionRegistry>>();
                     let mut registry = state.lock().unwrap();
                     let was_workspace = role == Some(WindowRole::Workspace);
                     registry.remove_label(&label);
-                    was_workspace
+                    (was_workspace, registry.has_workspace_windows())
                 };
                 if was_workspace {
                     let dirty_paths = app.state::<Mutex<DirtyWorkspacePaths>>();
                     let mut dirty_paths = dirty_paths.lock().unwrap();
-                    dirty_paths.clear();
+                    dirty_paths.clear_window(&label);
+                }
+                if should_update_restore_list_on_destroy(
+                    was_workspace,
+                    other_workspace_windows_remain,
+                ) {
+                    persist_open_workspace_roots(app);
                 }
                 {
                     let file_watch_state = app.state::<Mutex<file_watch::FileWatchState>>();

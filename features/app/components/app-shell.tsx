@@ -28,7 +28,7 @@ export function AppShell() {
 
         async function loadSession() {
             if (!isTauriRuntime()) {
-                setSession({ kind: "workspace" });
+                setSession(normalizeAppWindowSession({ kind: "workspace" }));
                 return;
             }
 
@@ -84,7 +84,7 @@ function renderSession(session: AppWindowSession) {
         return <DocumentError session={session} />;
     }
 
-    return <WorkspaceApp />;
+    return <WorkspaceApp session={session} />;
 }
 
 function sessionKey(session: AppWindowSession) {
@@ -169,14 +169,14 @@ export class AppRenderErrorBoundary extends Component<
 
 function normalizeSessionFromLocation(): AppWindowSession {
     if (typeof window === "undefined") {
-        return { kind: "workspace" };
+        return normalizeAppWindowSession({ kind: "workspace" });
     }
 
     const params = new URLSearchParams(window.location.search);
     const realPath = params.get("realPath");
 
     if (params.get("mode") !== "document" || !realPath) {
-        return { kind: "workspace" };
+        return normalizeAppWindowSession({ kind: "workspace" });
     }
 
     return normalizeAppWindowSession({

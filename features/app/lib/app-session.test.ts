@@ -6,6 +6,36 @@ describe("normalizeAppWindowSession", () => {
     it("normalizes workspace sessions", () => {
         expect(normalizeAppWindowSession({ kind: "workspace" })).toEqual({
             kind: "workspace",
+            rootPath: null,
+            skippedRoots: [],
+        });
+    });
+
+    it("carries the root a workspace window was opened for", () => {
+        expect(
+            normalizeAppWindowSession({
+                kind: "workspace",
+                rootPath: "/tmp/notes",
+                skippedRoots: ["/Volumes/ext/blog"],
+            }),
+        ).toEqual({
+            kind: "workspace",
+            rootPath: "/tmp/notes",
+            skippedRoots: ["/Volumes/ext/blog"],
+        });
+    });
+
+    it("drops malformed roots rather than passing them on", () => {
+        expect(
+            normalizeAppWindowSession({
+                kind: "workspace",
+                rootPath: "",
+                skippedRoots: ["/tmp/gone", "", 7, null],
+            }),
+        ).toEqual({
+            kind: "workspace",
+            rootPath: null,
+            skippedRoots: ["/tmp/gone"],
         });
     });
 

@@ -289,7 +289,15 @@ export interface PersistedAppState {
     recentWorkspaceRoot: string | null;
     preferences: AppPreferences;
     workspaces: PersistedWorkspaceState[];
+    /** The size a window with no workspace bound to it opens at. */
     windowSize: PersistedWindowSize;
+    /**
+     * The roots that were open when the app last ran.
+     *
+     * Written by the Rust window registry, never by a window: only the
+     * registry knows about every window.
+     */
+    openWorkspaceRoots: string[];
 }
 
 export interface AppPreferences {
@@ -307,6 +315,13 @@ export interface PersistedWorkspaceState {
     panels: WorkspacePanelState;
     /** The folder the tree was left showing, or null for the whole workspace. */
     treeFocusPath?: string | null;
+    /**
+     * This workspace's own window size.
+     *
+     * Absent until a window showing this root is resized; the top-level
+     * windowSize is used until then.
+     */
+    windowSize?: PersistedWindowSize;
 }
 
 export interface PersistedWorkspaceTab {

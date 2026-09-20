@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -20,8 +21,16 @@ pub struct AppState {
     pub preferences: AppPreferences,
     #[serde(default)]
     pub workspaces: Vec<PersistedWorkspaceState>,
+    /// The fallback size: used by a window with no root bound yet, and as the
+    /// seed for a root that has never been sized on its own.
     #[serde(default)]
     pub window_size: PersistedWindowSize,
+    /// The roots that were open when the app last ran, in window order.
+    ///
+    /// Derived from the window registry, never submitted by a frontend: only
+    /// the registry knows about every window.
+    #[serde(default)]
+    pub open_workspace_roots: Vec<String>,
 }
 
 impl Default for AppState {
@@ -32,6 +41,7 @@ impl Default for AppState {
             preferences: AppPreferences::default(),
             workspaces: Vec::new(),
             window_size: PersistedWindowSize::default(),
+            open_workspace_roots: Vec::new(),
         }
     }
 }
@@ -63,7 +73,7 @@ impl Default for AppPreferences {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedWorkspaceState {
     #[serde(default)]
@@ -80,6 +90,12 @@ pub struct PersistedWorkspaceState {
     /// and absent again once it is pointed back at the whole workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tree_focus_path: Option<String>,
+    /// This workspace's own window size.
+    ///
+    /// Absent until this root's window is resized; the top-level `window_size`
+    /// is used until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_size: Option<PersistedWindowSize>,
 }
 
 impl Default for PersistedWorkspaceState {
@@ -90,6 +106,7 @@ impl Default for PersistedWorkspaceState {
             active_tab_id: None,
             panels: PersistedPanelState::default(),
             tree_focus_path: None,
+            window_size: None,
         }
     }
 }
@@ -182,10 +199,163 @@ pub fn load_app_state() -> Result<AppState, WorkspaceError> {
     load_state_from_path(default_state_path()?)
 }
 
-#[tauri::command]
-pub fn save_app_state(mut state: AppState) -> Result<(), WorkspaceError> {
+/// Serializes every read-modify-write of the state file.
+///
+/// All windows live in one process, so this is the whole mutual exclusion the
+/// segmented writes need. It replaced whole-file overwrites from each window,
+/// which silently dropped whatever another window had saved since that window
+/// started.
+static STATE_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Read the state file, apply `mutate`, write it back, while holding the lock.
+///
+/// Neither `mutate` nor anything this calls may take `STATE_WRITE_LOCK` again:
+/// it is not re-entrant.
+fn mutate_state_at_path<F>(path: impl AsRef<Path>, mutate: F) -> Result<(), WorkspaceError>
+where
+    F: FnOnce(&mut AppState),
+{
+    let path = path.as_ref();
+    let _guard = STATE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let mut state = load_state_from_path(path)?;
+    mutate(&mut state);
     normalize_app_state(&mut state);
-    save_state_to_path(default_state_path()?, &state)
+    write_state_file(path, &state)
+}
+
+/// Merge one workspace's own state, leaving every other segment alone.
+#[tauri::command]
+pub fn save_workspace_state(workspace: PersistedWorkspaceState) -> Result<(), WorkspaceError> {
+    save_workspace_state_to_path(default_state_path()?, workspace)
+}
+
+pub fn save_workspace_state_to_path(
+    path: impl AsRef<Path>,
+    workspace: PersistedWorkspaceState,
+) -> Result<(), WorkspaceError> {
+    mutate_state_at_path(path, |state| upsert_workspace(state, workspace))
+}
+
+/// Record a window size against its root, or at the top level when a window
+/// has no root bound yet.
+#[tauri::command]
+pub fn save_window_size(
+    root_path: Option<String>,
+    window_size: PersistedWindowSize,
+) -> Result<(), WorkspaceError> {
+    save_window_size_to_path(default_state_path()?, root_path, window_size)
+}
+
+pub fn save_window_size_to_path(
+    path: impl AsRef<Path>,
+    root_path: Option<String>,
+    window_size: PersistedWindowSize,
+) -> Result<(), WorkspaceError> {
+    mutate_state_at_path(path, |state| match root_path {
+        Some(root_path) if !root_path.is_empty() => {
+            match state
+                .workspaces
+                .iter_mut()
+                .find(|workspace| workspace.root_path == root_path)
+            {
+                Some(workspace) => workspace.window_size = Some(window_size),
+                None => state.workspaces.insert(
+                    0,
+                    PersistedWorkspaceState {
+                        root_path,
+                        window_size: Some(window_size),
+                        ..PersistedWorkspaceState::default()
+                    },
+                ),
+            }
+        }
+        _ => state.window_size = window_size,
+    })
+}
+
+#[tauri::command]
+pub fn save_app_preferences(preferences: AppPreferences) -> Result<(), WorkspaceError> {
+    save_app_preferences_to_path(default_state_path()?, preferences)
+}
+
+pub fn save_app_preferences_to_path(
+    path: impl AsRef<Path>,
+    preferences: AppPreferences,
+) -> Result<(), WorkspaceError> {
+    mutate_state_at_path(path, |state| state.preferences = preferences)
+}
+
+/// Replace the open-root list. Called by the window registry, not a frontend.
+pub fn set_open_workspace_roots(roots: Vec<String>) -> Result<(), WorkspaceError> {
+    set_open_workspace_roots_to_path(default_state_path()?, roots)
+}
+
+pub fn set_open_workspace_roots_to_path(
+    path: impl AsRef<Path>,
+    roots: Vec<String>,
+) -> Result<(), WorkspaceError> {
+    mutate_state_at_path(path, |state| state.open_workspace_roots = roots)
+}
+
+/// Drop roots that could not be restored, and their saved tab state with them.
+///
+/// Deliberately destructive: a root that is gone takes its tabs and panels with
+/// it rather than accumulating in state.json forever. An unmounted external or
+/// network volume at launch therefore loses that workspace's tabs for good.
+pub fn forget_workspace_roots(roots: &[String]) -> Result<(), WorkspaceError> {
+    forget_workspace_roots_at_path(default_state_path()?, roots)
+}
+
+pub fn forget_workspace_roots_at_path(
+    path: impl AsRef<Path>,
+    roots: &[String],
+) -> Result<(), WorkspaceError> {
+    if roots.is_empty() {
+        return Ok(());
+    }
+
+    mutate_state_at_path(path, |state| {
+        state
+            .open_workspace_roots
+            .retain(|root| !roots.contains(root));
+        state
+            .workspaces
+            .retain(|workspace| !roots.contains(&workspace.root_path));
+        if state
+            .recent_workspace_root
+            .as_ref()
+            .is_some_and(|root| roots.contains(root))
+        {
+            state.recent_workspace_root = None;
+        }
+    })
+}
+
+fn upsert_workspace(state: &mut AppState, workspace: PersistedWorkspaceState) {
+    let root_path = workspace.root_path.clone();
+    // A save that carries no size must not erase the one already recorded.
+    let window_size = workspace.window_size.or_else(|| {
+        state
+            .workspaces
+            .iter()
+            .find(|candidate| candidate.root_path == root_path)
+            .and_then(|candidate| candidate.window_size.clone())
+    });
+
+    state
+        .workspaces
+        .retain(|candidate| candidate.root_path != root_path);
+    state.workspaces.insert(
+        0,
+        PersistedWorkspaceState {
+            window_size,
+            ..workspace
+        },
+    );
+    state.recent_workspace_root = Some(root_path);
 }
 
 pub fn load_state_from_path(path: impl AsRef<Path>) -> Result<AppState, WorkspaceError> {
@@ -201,8 +371,13 @@ pub fn load_state_from_path(path: impl AsRef<Path>) -> Result<AppState, Workspac
             }
             Err(_) => {
                 backup_corrupt_state_file(path)?;
-                let state = AppState::default();
-                let _ = save_state_to_path(path, &state);
+                let mut state = AppState::default();
+                normalize_app_state(&mut state);
+                // write_state_file, not save_state_to_path: a merge calls this
+                // function with STATE_WRITE_LOCK already held, and the lock is
+                // not re-entrant — taking it again deadlocks that thread and
+                // every later save in every window behind it.
+                let _ = write_state_file(path, &state);
                 Ok(state)
             }
         },
@@ -215,10 +390,24 @@ pub fn load_state_from_path(path: impl AsRef<Path>) -> Result<AppState, Workspac
     }
 }
 
+/// Write a whole state file.
+///
+/// Only the tests still do this. The app writes one segment at a time so that
+/// two windows cannot overwrite each other.
+#[cfg(test)]
 pub fn save_state_to_path(path: impl AsRef<Path>, state: &AppState) -> Result<(), WorkspaceError> {
     let path = path.as_ref();
+    let _guard = STATE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut state = state.clone();
     normalize_app_state(&mut state);
+    write_state_file(path, &state)
+}
+
+/// The atomic write itself. Callers hold `STATE_WRITE_LOCK` and have already
+/// normalized; this must never take the lock, or it deadlocks its callers.
+fn write_state_file(path: &Path, state: &AppState) -> Result<(), WorkspaceError> {
     let parent = path.parent().ok_or_else(|| {
         WorkspaceError::new("state_save_failed", "state path has no parent directory")
     })?;
@@ -230,7 +419,7 @@ pub fn save_state_to_path(path: impl AsRef<Path>, state: &AppState) -> Result<()
         )
     })?;
 
-    let bytes = serde_json::to_vec_pretty(&state).map_err(|error| {
+    let bytes = serde_json::to_vec_pretty(state).map_err(|error| {
         WorkspaceError::new(
             "state_save_failed",
             format!("failed to serialize app state: {error}"),
@@ -388,6 +577,7 @@ fn normalize_workspace_state(
             .as_ref()
             .map(|path| path.trim().to_string())
             .filter(|path| !path.is_empty()),
+        window_size: workspace.window_size.as_ref().map(normalize_window_size),
     })
 }
 

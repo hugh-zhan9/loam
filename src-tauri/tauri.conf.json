@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "label": "workspace-main",
+        "label": "workspace-template",
         "title": "Loam",
         "url": "/",
         "create": false,
