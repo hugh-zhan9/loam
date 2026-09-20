@@ -50,16 +50,59 @@ describe("local app installation", () => {
     expect(readdirSync(folder).sort()).toEqual(["Loam.app", "built.app"]);
   });
 
-  it("refuses to replace a running app instead of bypassing unsaved window edits", async () => {
+  // `ps -axo pid=,comm=` for a running installed app, plus an unrelated process.
+  function runningPs() {
+    const executable = join(realpathSync(destinationApp), "Contents", "MacOS", "loam");
+    return `  4321 ${executable}\n  4322 /usr/bin/something-else\n`;
+  }
+
+  it("leaves a running app alone when nobody chose to end it", async () => {
     vi.mocked(spawnSync).mockImplementation((name) => ({
-      status: name === "osascript" ? 1 : 0,
-      stdout: name === "ps" ? join(realpathSync(destinationApp), "Contents", "MacOS", "loam") : "",
-      stderr: "cancelled",
+      status: 0,
+      stdout: name === "ps" ? runningPs() : "",
+      stderr: "",
     }));
-    await expect(installLocalApp({ sourceApp, destinationApp })).rejects.toThrow("Loam is running");
+    await expect(
+      installLocalApp({ sourceApp, destinationApp, onRunning: async () => "abort" }),
+    ).rejects.toThrow("Loam is running");
     expect(binary(destinationApp)).toBe("old");
+    // Nothing is sent to the app itself, and it is not signalled.
     expect(spawnSync.mock.calls.some(([name]) => name === "osascript")).toBe(false);
   });
+
+  it("asks the app to quit itself so it can save what it has open", async () => {
+    // Only the app can see every window's unsaved tabs, so saving is its job,
+    // not this script's.
+    let quitting = false;
+    vi.mocked(spawnSync).mockImplementation((name) => {
+      if (name === "osascript") quitting = true;
+      return { status: 0, stdout: name === "ps" && !quitting ? runningPs() : "", stderr: "" };
+    });
+
+    const result = await installLocalApp({
+      sourceApp,
+      destinationApp,
+      onRunning: async () => "quit",
+    });
+
+    expect(spawnSync.mock.calls.some(([name, args]) =>
+      name === "osascript" && args.join(" ").includes('quit app "Loam"'))).toBe(true);
+    expect(binary(result.destinationApp)).toBe("new");
+  });
+
+  it("refuses when the app is still running after being asked to stop", async () => {
+    // Never swap the bundle under a live process: it goes on loading
+    // resources from a path that has moved.
+    vi.mocked(spawnSync).mockImplementation((name) => ({
+      status: 0,
+      stdout: name === "ps" ? runningPs() : "",
+      stderr: "",
+    }));
+    await expect(
+      installLocalApp({ sourceApp, destinationApp, onRunning: async () => "force" }),
+    ).rejects.toThrow("still running");
+    expect(binary(destinationApp)).toBe("old");
+  }, 30_000);
 
   it("rejects a missing build or the installed bundle as its own source", async () => {
     await expect(installLocalApp({ sourceApp: join(folder, "absent.app"), destinationApp })).rejects.toThrow("not found");
