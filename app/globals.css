@@ -591,6 +591,17 @@ html[data-mdx-bg="tile"] [data-mdx-content-surface] {
     white-space: pre;
 }
 
+[data-mdx-markdown-editor] :not(pre) > code {
+    background: var(--mdx-code-bg);
+    border: 1px solid var(--color-base-300);
+    border-radius: 0.25em;
+    box-decoration-break: clone;
+    -webkit-box-decoration-break: clone;
+    font-family: var(--mdx-mono-font);
+    font-size: 0.9em;
+    padding: 0.1em 0.3em;
+}
+
 [data-mdx-markdown-editor] pre > code {
     display: block;
     font-family: inherit;

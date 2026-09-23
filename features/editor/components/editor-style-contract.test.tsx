@@ -47,6 +47,10 @@ const FIXTURE = `# 一级标题
 
 普通段落，包含 **加粗**、*斜体* 与 \`行内代码\`。
 
+\`Message\` 是那 4 种标准的；\`CustomAgentMessages[keyof CustomAgentMessages]\` 是应用注册了什么就是什么。**注册是可加的**：上面那段 \`declare module\` 只是往 \`CustomAgentMessages\` 这个接口里加字段。
+
+混合样式：**加粗中的 \`code\`** 与 *斜体中的 \`code\`*。
+
 - 项一
 - 项二
 
@@ -122,6 +126,7 @@ const STYLED_ELEMENTS: Array<{ selector: string; renders: string }> = [
     { selector: "h5", renders: "五级标题" },
     { selector: "h6", renders: "六级标题" },
     { selector: "p", renders: "段落" },
+    { selector: ":not(pre) > code", renders: "行内代码" },
     { selector: "ul", renders: "无序列表" },
     { selector: "ol", renders: "有序列表" },
     { selector: "li", renders: "列表项" },
@@ -136,6 +141,25 @@ const STYLED_ELEMENTS: Array<{ selector: string; renders: string }> = [
 ];
 
 describe("editor style contract", () => {
+    it("targets inline code, including nested marks, without styling fenced code as inline", async () => {
+        const container = await mountFixture();
+        const inlineCode = Array.from(
+            container.querySelectorAll(`${ROOT} :not(pre) > code`),
+            (element) => element.textContent,
+        );
+        expect(inlineCode).toEqual([
+            "行内代码",
+            "Message",
+            "CustomAgentMessages[keyof CustomAgentMessages]",
+            "declare module",
+            "CustomAgentMessages",
+            "code",
+            "code",
+        ]);
+        expect(container.querySelector(`${ROOT} pre > code`)?.textContent)
+            .toContain("const a = 1;");
+    });
+
     it("renders every element the stylesheet styles", async () => {
         const container = await mountFixture();
         const root = container.querySelector(ROOT);
