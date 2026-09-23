@@ -605,7 +605,8 @@ export const MarkdownEditorSurface = forwardRef<
             if (
                 !isFindOpen ||
                 event.key !== "Enter" ||
-                event.nativeEvent.isComposing
+                event.nativeEvent.isComposing ||
+                event.nativeEvent.keyCode === 229
             ) {
                 return;
             }

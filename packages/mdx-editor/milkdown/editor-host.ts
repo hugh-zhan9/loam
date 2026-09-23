@@ -1,3 +1,5 @@
+import "prosemirror-view/style/prosemirror.css";
+
 import {
     Editor,
     defaultValueCtx,
@@ -421,6 +423,20 @@ export async function createMilkdownEditorHost(
             ctx.update(editorViewOptionsCtx, (prev) => ({
                 ...prev,
                 editable: () => currentEditable,
+                handleDOMEvents: {
+                    ...prev.handleDOMEvents,
+                    keydown(view, event) {
+                        // WebKit can send the confirming Enter after
+                        // compositionend. Its IME marker remains meaningful
+                        // even after ProseMirror's composition grace period.
+                        // Skip editor commands without cancelling IME commit.
+                        if (
+                            event.key === "Enter" &&
+                            (event.isComposing || event.keyCode === 229)
+                        ) return true;
+                        return prev.handleDOMEvents?.keydown?.(view, event) ?? false;
+                    },
+                },
             }));
             // Every edit re-serializes the whole document, so the serializer's
             // defaults decide how much untouched text a single keystroke

@@ -320,6 +320,24 @@ describe("adapter surface find bar — what counts as a match", () => {
         expect(harness.selection()?.before.length).toBe(second);
     }, 60000);
 
+    it("does not move the selection when Enter confirms IME input in the editor", async () => {
+        const harness = await mountSurface(PROSE);
+        await openFind(harness);
+        await search(harness, "alpha");
+        const before = harness.selection();
+
+        for (const flags of [{ isComposing: true }, { keyCode: 229 }]) {
+            await act(async () => {
+                harness.editor().dispatchEvent(new KeyboardEvent("keydown", {
+                    key: "Enter", bubbles: true, cancelable: true, ...flags,
+                }));
+            });
+            expect(countLabel(harness)).toBe("1/3");
+            expect(harness.selection()).toEqual(before);
+            expect(harness.markdown()).toBe(PROSE);
+        }
+    });
+
     it("honours the case-sensitivity toggle", async () => {
         const harness = await mountSurface("Alpha and alpha.\n");
 
