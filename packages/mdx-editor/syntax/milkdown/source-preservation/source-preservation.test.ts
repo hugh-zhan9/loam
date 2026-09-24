@@ -20,6 +20,7 @@ import {
     unknownSyntaxFixtures,
 } from "../../../test/syntax-fixtures";
 import { sourcePreservationPlugins } from "./index";
+import { createMdxMilkdownPlugins } from "../index";
 import { sanitizePastedHtml } from "./clipboard-guard";
 import {
     HTML_SOURCE_INLINE_NODE,
@@ -241,6 +242,49 @@ describe("html source round-trips byte-for-byte", () => {
         );
         expect(nodesOfType(root, HTML_SOURCE_INLINE_NODE)).toHaveLength(4);
         expect(nodesOfType(root, HTML_SOURCE_NODE)).toHaveLength(0);
+    });
+
+    it.each([
+        '<a id="D-003"></a>',
+        "<a id='D-003'> </a>",
+        '<a id="D-003">\n</a>',
+        '<a id="D-003"></a><a id="D-004"></a>',
+        '<a id="D-003"></a>\n<a id="D-004"></a>',
+    ])("previews standalone empty anchors without source controls: %s", async (html) => {
+        const markdown = `${html}\n\n## D-003 · Behavior Contract\n`;
+        const { host, root } = await mount(`${ANCHOR}${markdown}`);
+
+        expect(nodesOfType(root, HTML_SOURCE_INLINE_NODE)).toHaveLength(0);
+        const block = nodesOfType(root, HTML_SOURCE_NODE)[0];
+        expect(block).toBeDefined();
+        expect(block.querySelector("pre")?.hidden).toBe(true);
+        expect(block.querySelector("input")).toBeNull();
+        const preview = block.querySelector(`[${PREVIEW_ATTR}]`)!;
+        expect(preview.querySelector("a")).not.toBeNull();
+        expect(preview.textContent?.trim()).toBe("");
+        expect(root.querySelector("h2")?.textContent).toBe("D-003 · Behavior Contract");
+
+        expect(host.replaceSourceRange({ anchor: 0, head: 0 }, "X")).toBe(true);
+        host.flush();
+        expect(host.getMarkdown()).toBe(`X${ANCHOR}${markdown}`);
+    });
+
+    it.each(["> ", "- "])("preserves standalone anchors inside %s containers", async (prefix) => {
+        const markdown = `${prefix}<a id="D-003"></a>\n`;
+        const { root } = await mount(markdown, createMdxMilkdownPlugins());
+        expect(nodesOfType(root, HTML_SOURCE_INLINE_NODE)).toHaveLength(0);
+        expect(previews(root)[0].querySelector("a")).not.toBeNull();
+        expect(await serializeAfterAnchorEdit(markdown, createMdxMilkdownPlugins()))
+            .toBe(`X${ANCHOR}${markdown}`);
+    });
+
+    it("keeps anchor examples literal in code", async () => {
+        const html = '<a id="D-003"></a>';
+        const markdown = `\`${html}\`\n\n\`\`\`html\n${html}\n\`\`\`\n`;
+        const { root } = await mount(markdown);
+        expect(previews(root)).toHaveLength(0);
+        expect(root.querySelector("code")?.textContent).toBe(html);
+        await expectRoundTrip(markdown);
     });
 
     it("survives a second serialization pass unchanged", async () => {

@@ -171,6 +171,33 @@ describe("surface mode — the two surfaces are one session", () => {
         expect(session.container.querySelector("h1")?.textContent).toBe("Title");
     });
 
+    it("keeps empty anchor markup in source mode and out of the visual text", async () => {
+        const markdown = '<a id="D-003"></a>\n\n## D-003 · Behavior Contract\n';
+        const session = await openSession(markdown);
+        const expectPreview = () => {
+            const preview = session.container.querySelector("[data-mdx-preview]");
+            expect(preview?.querySelector("a")).not.toBeNull();
+            expect(preview?.textContent).toBe("");
+            expect(session.container.querySelector(".mdx-inline-source-input")).toBeNull();
+            expect(session.container.querySelector("h2")?.textContent).toBe("D-003 · Behavior Contract");
+        };
+        expectPreview();
+
+        await act(async () => {
+            await session.handle.current!.setMode("source");
+        });
+        await session.settle();
+        expect(session.container.querySelector(".cm-content")?.textContent).toContain('<a id="D-003"></a>');
+
+        await act(async () => {
+            await session.handle.current!.setMode("wysiwyg");
+        });
+        await session.settle();
+        expectPreview();
+        expect(session.markdown()).toBe(markdown);
+        expect(session.changes).toEqual([]);
+    });
+
     it("carries an unconfirmed edit across the switch", async () => {
         const session = await openSession("start\n");
         await act(async () => {

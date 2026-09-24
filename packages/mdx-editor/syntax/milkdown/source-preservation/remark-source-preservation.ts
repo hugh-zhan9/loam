@@ -9,6 +9,8 @@ export interface MdastNode {
     value?: unknown;
     /** A fenced code block's info string beyond its language. */
     meta?: unknown;
+    /** Milkdown marks soft line breaks introduced by its remark transformer. */
+    data?: { isInline?: boolean };
     children?: MdastNode[];
     position?: {
         start: { line: number; column: number; offset?: number | undefined };
@@ -162,17 +164,29 @@ function directiveSource(node: MdastNode, source: string): string | null {
 }
 
 /**
- * The raw HTML of a paragraph that only exists because commonmark's own remark
- * transformer wrapped a block-level `html` node in one.
+ * The raw HTML of a paragraph containing only HTML and separating whitespace.
  *
- * The wrapper copies the html node's position onto the paragraph, so a
- * paragraph whose single child spans exactly the same source was block HTML
- * before the wrapping. A paragraph that merely starts with inline HTML has
- * other children, or a wider span.
+ * CommonMark splits standalone inline tags such as `<a id="x"></a>` into
+ * siblings. Preview them together, just like a wrapped block-level HTML node,
+ * rather than exposing a separate source control for each tag. Paragraphs
+ * containing Markdown prose keep their inline structure.
  */
-function blockHtmlSource(node: MdastNode): string | null {
+function blockHtmlSource(node: MdastNode, source: string): string | null {
     const children = node.children;
-    if (!children || children.length !== 1) return null;
+    if (!children || children.length === 0) return null;
+    if (children.length > 1) {
+        const onlyHtml = children.every(
+            (child) =>
+                (child.type === "html" && typeof child.value === "string") ||
+                (child.type === "text" &&
+                    typeof child.value === "string" &&
+                    /^[\t\n\r ]*$/.test(child.value)) ||
+                (child.type === "break" && child.data?.isInline === true),
+        );
+        return onlyHtml && children.some((child) => child.type === "html")
+            ? rawSlice(node, source)
+            : null;
+    }
     const child = children[0];
     if (child.type !== "html" || typeof child.value !== "string") return null;
     if (
@@ -474,7 +488,7 @@ function replaceBlock(
     }
     if (node.type !== "paragraph") return null;
 
-    const html = blockHtmlSource(node);
+    const html = blockHtmlSource(node, source);
     if (html !== null) {
         return preserved(HTML_SOURCE_MDAST, html, undefined, node.position);
     }
