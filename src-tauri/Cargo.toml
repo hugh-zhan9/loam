@@ -45,6 +45,7 @@ serde = { version = "1", features = ["derive"] }
 # not alphabetised.
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 serde_yaml_ng = "0.10.0"
+hmac = "0.12"
 sha2 = "0.10"
 tauri = { version = "2.10.3", features = ["devtools"] }
 tauri-plugin-dialog = "2"

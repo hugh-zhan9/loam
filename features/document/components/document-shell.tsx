@@ -21,6 +21,7 @@ import type {
 } from "@/features/file-watch/lib/types";
 import { DiffViewer } from "@/features/recovery/components/diff-viewer";
 import { RecoveryBanner } from "@/features/recovery/components/recovery-banner";
+import { ImageFailureBar } from "@/features/editor/components/image-failure-bar";
 import { useDraftAutosave } from "@/features/recovery/hooks/use-draft-autosave";
 import { draftDelete, draftGet } from "@/features/recovery/lib/draft-client";
 import { useAppDialogs } from "@/features/workspace/components/app-dialogs";
@@ -86,6 +87,8 @@ export function DocumentShell({
   const [state, setState] = useState<LoadedDocumentState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  // Why the images last pasted did not all land; see ImageFailureBar.
+  const [imageFailure, setImageFailure] = useState<string | null>(null);
   const [workspaceDirty, setWorkspaceDirty] = useState(
     session.workspaceDirty === true,
   );
@@ -1139,6 +1142,11 @@ export function DocumentShell({
           ) : null}
         </div>
 
+        <ImageFailureBar
+          message={imageFailure}
+          onDismiss={() => setImageFailure(null)}
+        />
+
         <div
           className="grid min-h-0 min-w-0 flex-1 overflow-hidden"
           data-document-editor-grid=""
@@ -1166,6 +1174,7 @@ export function DocumentShell({
                   documentPath: state.realPath,
                 })
               }
+              onImageFailure={setImageFailure}
               services={{
                 // A document window has no workspace root; a relative asset
                 // is relative to the file being edited.

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act } from "react";
+import { act, useState, type ComponentProps } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EditorStage } from "./editor-stage";
@@ -120,6 +120,8 @@ describe("EditorStage preview routing", () => {
           editorSurfaceRef={options.editorSurfaceRef}
           pendingCliCommand={null}
           onPendingCliCommandHandled={vi.fn()}
+          imageFailure={null}
+          onImageFailure={vi.fn()}
           onSelectionChange={options.onSelectionChange ?? vi.fn()}
         />,
       );
@@ -185,6 +187,75 @@ describe("EditorStage adapter surface wiring", () => {
       rootPath: "/tmp/ws",
     });
   });
+
+  it.each([
+    ["the tab it was pasted into is closed", null],
+    [
+      "an image tab is shown instead",
+      {
+        tabId: "tab-img",
+        path: "/tmp/ws/photo.png",
+        title: "photo.png",
+        dirty: false,
+        needsRenameOnFirstSave: false,
+      } satisfies WorkspaceTab,
+    ],
+  ])(
+    "keeps an image failure on screen after %s",
+    async (_case, nextTab: WorkspaceTab | null) => {
+      let finishStore: (stored: { url: string; altText: string }) => void =
+        () => {};
+      imageStorageMocks.storeImageForWorkspace.mockReturnValueOnce(
+        new Promise((resolve) => {
+          finishStore = resolve;
+        }),
+      );
+      const session = createEditorSessionBinding();
+      const renderHost = (activeTab: WorkspaceTab | null) =>
+        root.render(
+          <StageWithImageFailure
+            rootPath="/tmp/ws"
+            activeTab={activeTab}
+            dispatch={vi.fn()}
+            editorSession={session}
+            pendingCliCommand={null}
+            onPendingCliCommandHandled={vi.fn()}
+            onSelectionChange={vi.fn()}
+          />,
+        );
+      await act(async () => {
+        renderHost(tab);
+        await flushPromises();
+      });
+
+      const file = new File(["image"], "clip.png", { type: "image/png" });
+      const event = new Event("paste", { bubbles: true, cancelable: true });
+      Object.defineProperty(event, "clipboardData", {
+        value: { files: [file], items: [], types: ["Files"], getData: () => "" },
+      });
+      await act(async () => {
+        host.querySelector(".ProseMirror")?.dispatchEvent(event);
+        await flushPromises();
+      });
+
+      // The editor goes away while the image is still being uploaded.
+      await act(async () => {
+        renderHost(nextTab);
+        await flushPromises();
+      });
+      expect(host.querySelector(".ProseMirror")).toBeNull();
+
+      await act(async () => {
+        finishStore({ url: "https://img.example/clip.png", altText: "clip" });
+        await flushPromises();
+      });
+
+      const notice = host.querySelector("[data-mdx-image-notice='failed']");
+      expect(notice?.textContent).toContain(
+        "图片未插入：粘贴时的文档已不在编辑器中",
+      );
+    },
+  );
 
   it("writes a stored image link into the document exactly as it was handed over", async () => {
     // A document below the workspace root gets a link that climbs back to the
@@ -274,6 +345,8 @@ describe("EditorStage adapter surface wiring", () => {
           editorSurfaceRef={options.editorSurfaceRef}
           pendingCliCommand={null}
           onPendingCliCommandHandled={vi.fn()}
+          imageFailure={null}
+          onImageFailure={vi.fn()}
           onSelectionChange={options.onSelectionChange}
         />,
       );
@@ -281,6 +354,23 @@ describe("EditorStage adapter surface wiring", () => {
     });
   }
 });
+
+/** The stage with its image failure held above it, as the workspace shell holds it. */
+function StageWithImageFailure(
+  props: Omit<
+    ComponentProps<typeof EditorStage>,
+    "imageFailure" | "onImageFailure"
+  >,
+) {
+  const [imageFailure, setImageFailure] = useState<string | null>(null);
+  return (
+    <EditorStage
+      {...props}
+      imageFailure={imageFailure}
+      onImageFailure={setImageFailure}
+    />
+  );
+}
 
 async function flushPromises() {
   await new Promise((resolve) => setTimeout(resolve, 0));

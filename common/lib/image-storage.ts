@@ -1,3 +1,4 @@
+import { getImageHostConfig, uploadImageToHost } from "./image-host";
 import { tauriCore } from "./tauri";
 
 const MIME_TO_EXT: Record<string, string> = {
@@ -19,7 +20,8 @@ export interface StoredImage {
 }
 
 export interface StoredWorkspaceImage extends StoredImage {
-    storedPath: string;
+    /** Where the file was written; null when it went to the image host. */
+    storedPath: string | null;
     usedFallback: boolean;
 }
 
@@ -55,6 +57,28 @@ function extOf(file: File | Blob, nameHint?: string): string {
     return MIME_TO_EXT[file.type] || "bin";
 }
 
+/**
+ * The remote URL when the image host is on, or null to store the image locally.
+ *
+ * Read afresh for every image: the setting is shared by every window, and one of
+ * them may have just changed it. Anything that goes wrong is thrown, a config
+ * that cannot be read included — a host the user turned on must not quietly
+ * become a local save.
+ */
+async function uploadWhenHostEnabled(
+    name: string,
+    bytes: Uint8Array,
+    invoke: NonNullable<StoreImageForWorkspaceOptions["invoke"]>,
+): Promise<string | null> {
+    const config = await getImageHostConfig(invoke);
+    if (!config.enabled) return null;
+    return uploadImageToHost(name, bytes, invoke);
+}
+
+function hostedImage(url: string, altText: string): StoredWorkspaceImage {
+    return { url, altText, storedPath: null, usedFallback: false };
+}
+
 function isPassthroughImageUrl(src: string): boolean {
     return src.startsWith("//") || /^(https?:|data:|blob:)/i.test(src);
 }
@@ -71,6 +95,9 @@ export async function storeImageForWorkspace(
     const { invoke } = options.invoke
         ? { invoke: options.invoke }
         : await tauriCore();
+    const hostedUrl = await uploadWhenHostEnabled(name, bytes, invoke);
+    if (hostedUrl !== null) return hostedImage(hostedUrl, altText);
+
     const response = await invoke<SaveImageAssetResponse>("save_image_asset", {
         rootPath: options.rootPath ?? null,
         currentFilePath: options.currentFilePath ?? null,
@@ -98,6 +125,9 @@ export async function storeImageForDocument(
     const { invoke } = options.invoke
         ? { invoke: options.invoke }
         : await tauriCore();
+    const hostedUrl = await uploadWhenHostEnabled(name, bytes, invoke);
+    if (hostedUrl !== null) return hostedImage(hostedUrl, altText);
+
     const response = await invoke<SaveImageAssetResponse>(
         "save_document_image_asset",
         {

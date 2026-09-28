@@ -68,6 +68,55 @@ const LINK_EDITOR_LABELS = {
     remove: "移除链接",
 };
 
+/**
+ * How long a batch of images runs before it is shown as running.
+ *
+ * A local save finishes in a few milliseconds and should not flash a bar; an
+ * upload takes seconds, and without one the user pastes again.
+ */
+const IMAGE_PROGRESS_DELAY_MS = 300;
+
+/** Why an image did not land, in words; the store is the caller's, so its error says why. */
+function describeImageStoreError(error: unknown): string {
+    if (error instanceof Error && error.message) return error.message;
+    if (typeof error === "string" && error.length > 0) return error;
+    if (
+        error &&
+        typeof error === "object" &&
+        "message" in error &&
+        typeof error.message === "string" &&
+        error.message.length > 0
+    ) {
+        return error.message;
+    }
+    return "未知错误";
+}
+
+function describeImageRefusal(code: EditorCommandFailureCode): string {
+    switch (code) {
+        case "stale_document":
+            return "粘贴时的文档已不在编辑器中";
+        case "stale_revision":
+            return "文档已被重新加载或替换";
+        default:
+            return `编辑器拒绝了插入（${code}）`;
+    }
+}
+
+/**
+ * What the failure bar says: why, and — for a batch — how much of it is missing.
+ * The count includes the image that failed and every one after it.
+ */
+function imageFailureMessage(
+    reason: string,
+    notInserted: number,
+    total: number,
+): string {
+    return total > 1
+        ? `图片未插入：${reason}（本次共 ${notInserted} 张未插入）`
+        : `图片未插入：${reason}`;
+}
+
 /** Why a pinned command did not run. */
 export interface EditorCommandRefusal {
     commandId: string;
@@ -135,6 +184,16 @@ export interface MarkdownEditorSurfaceProps {
      */
     storeImage?: (file: File) => Promise<{ url: string; altText: string }>;
     /**
+     * Receives why the images last pasted or dropped did not all land, and
+     * `null` when a new paste starts and that is no longer the latest news.
+     *
+     * The caller shows it, not this surface: an image is most often refused
+     * because its tab was closed or switched away from while it was stored,
+     * and by then this surface is no longer mounted to show anything. A caller
+     * that passes `storeImage` should pass this too.
+     */
+    onImageFailure?: (message: string | null) => void;
+    /**
      * What the rendered document needs the product to do for it: resolve the
      * relative path an image was written with, tokenize a fenced language.
      * Neither is something the editor can answer on its own, and neither
@@ -187,6 +246,7 @@ export const MarkdownEditorSurface = forwardRef<
         onOpenWikilink,
         onOpenLink,
         storeImage,
+        onImageFailure,
         services,
         pendingCliCommand = null,
         onPendingCliCommandHandled,
@@ -206,6 +266,7 @@ export const MarkdownEditorSurface = forwardRef<
     const onSelectionChangeRef = useRef(onSelectionChange);
     const onCommandRefusedRef = useRef(onCommandRefused);
     const storeImageRef = useRef(storeImage);
+    const onImageFailureRef = useRef(onImageFailure);
 
     const adapterRef = useRef<MarkdownEditorAdapterHandle | null>(null);
     /**
@@ -244,6 +305,42 @@ export const MarkdownEditorSurface = forwardRef<
         revision: number;
         message: string;
     } | null>(null);
+    /** The latest running batch, once it has run long enough to be shown. */
+    const [imageProgress, setImageProgress] = useState<{
+        done: number;
+        total: number;
+    } | null>(null);
+    /** Batches still storing, in the order they started. */
+    const imageBatchesRef = useRef(
+        new Map<
+            number,
+            { documentId: string; done: number; total: number; shown: boolean }
+        >(),
+    );
+    const imageBatchSequenceRef = useRef(0);
+
+    const reportImageFailure = useCallback((message: string | null) => {
+        const report = onImageFailureRef.current;
+        if (report) {
+            report(message);
+        } else if (message !== null) {
+            console.warn(message);
+        }
+    }, []);
+
+    const refreshImageProgress = useCallback(() => {
+        // Only a batch aimed at the document on screen can still land; one
+        // pasted into a document the user has since switched away from will
+        // be refused, and its progress over this one would say otherwise.
+        const onScreen = snapshotRef.current?.documentId;
+        const shown = [...imageBatchesRef.current.values()].filter(
+            (batch) => batch.shown && batch.documentId === onScreen,
+        );
+        const latest = shown.at(-1);
+        setImageProgress(
+            latest ? { done: latest.done, total: latest.total } : null,
+        );
+    }, []);
 
     /** The mounted document's selection, or null when it belongs elsewhere. */
     const currentSelection = useCallback((): EditorSourceSelection | null => {
@@ -272,7 +369,14 @@ export const MarkdownEditorSurface = forwardRef<
         onSelectionChangeRef.current = onSelectionChange;
         onCommandRefusedRef.current = onCommandRefused;
         storeImageRef.current = storeImage;
+        onImageFailureRef.current = onImageFailure;
     });
+
+    // Declared after the effect above so it reads the document now on screen:
+    // a tab switch changes which running batches can still land.
+    useEffect(() => {
+        refreshImageProgress();
+    }, [snapshot.documentId, refreshImageProgress]);
 
     const reportSelection = useCallback(
         (
@@ -663,6 +767,10 @@ export const MarkdownEditorSurface = forwardRef<
      * restore, a conflict resolution, a closed tab — the insert is refused. The
      * caret at that moment belongs to a different document state and is never
      * used as a substitute.
+     *
+     * The batch stops at the first image that cannot be stored or inserted;
+     * those already inserted stay, and the user is told why and how many did
+     * not land. Nothing is retried or stored anywhere else.
      */
     const storeAndInsertImages = useCallback(async (files: File[]) => {
         const store = storeImageRef.current;
@@ -675,54 +783,102 @@ export const MarkdownEditorSurface = forwardRef<
         /** What the previous insert left the document holding. */
         let expectedMarkdown: string | null = null;
 
-        for (const file of files) {
-            const stored = await store(file);
-            const current = snapshotRef.current;
+        imageBatchSequenceRef.current += 1;
+        const batchId = imageBatchSequenceRef.current;
+        const batch = {
+            documentId: pinnedDocumentId,
+            done: 0,
+            total: files.length,
+            shown: false,
+        };
+        imageBatchesRef.current.set(batchId, batch);
+        // A new paste is the user moving on from the last one's failure.
+        reportImageFailure(null);
+        const showTimer = setTimeout(() => {
+            batch.shown = true;
+            refreshImageProgress();
+        }, IMAGE_PROGRESS_DELAY_MS);
+        const fail = (index: number, reason: string) =>
+            reportImageFailure(
+                imageFailureMessage(reason, files.length - index, files.length),
+            );
 
-            if (!current || current.documentId !== pinnedDocumentId) {
-                onCommandRefusedRef.current?.({
-                    commandId: `image:${pinnedDocumentId}`,
-                    kind: "insert-image",
-                    code: "stale_document",
-                });
-                return;
-            }
+        /** The image being worked on, for a failure nothing else caught. */
+        let reached = 0;
+        try {
+            for (const [index, file] of files.entries()) {
+                reached = index;
+                let stored: { url: string; altText: string };
+                try {
+                    stored = await store(file);
+                } catch (error) {
+                    fail(index, describeImageStoreError(error));
+                    return;
+                }
+                const current = snapshotRef.current;
 
-            if (expectedMarkdown !== null) {
-                // Only this batch's own inserts may advance the pin. Anything
-                // else that reached the document since the last file moved the
-                // text the pin was measured against.
-                if (current.markdown !== expectedMarkdown) {
+                if (!current || current.documentId !== pinnedDocumentId) {
                     onCommandRefusedRef.current?.({
                         commandId: `image:${pinnedDocumentId}`,
                         kind: "insert-image",
-                        code: "stale_revision",
+                        code: "stale_document",
                     });
+                    fail(index, describeImageRefusal("stale_document"));
                     return;
                 }
-                pinnedRevision = current.revision;
+
+                if (expectedMarkdown !== null) {
+                    // Only this batch's own inserts may advance the pin. Anything
+                    // else that reached the document since the last file moved the
+                    // text the pin was measured against.
+                    if (current.markdown !== expectedMarkdown) {
+                        onCommandRefusedRef.current?.({
+                            commandId: `image:${pinnedDocumentId}`,
+                            kind: "insert-image",
+                            code: "stale_revision",
+                        });
+                        // The batch's own check, not the adapter's: most often the
+                        // user typed while the next image was being stored.
+                        fail(index, "插入过程中文档被修改");
+                        return;
+                    }
+                    pinnedRevision = current.revision;
+                }
+
+                const before = current.markdown;
+                commandSequenceRef.current += 1;
+                const result = await runCommand({
+                    commandId: `image:${pinnedDocumentId}:${commandSequenceRef.current}`,
+                    documentId: pinnedDocumentId,
+                    baseRevision: pinnedRevision,
+                    selection: target,
+                    kind: "insert-image",
+                    image: { src: stored.url, alt: stored.altText },
+                });
+
+                if (!result.ok) {
+                    fail(index, describeImageRefusal(result.code));
+                    return;
+                }
+
+                expectedMarkdown = markdownRef.current;
+                target = advancePinnedSelection(
+                    target,
+                    expectedMarkdown.length - before.length,
+                );
+                batch.done = index + 1;
+                if (batch.shown) refreshImageProgress();
             }
-
-            const before = current.markdown;
-            commandSequenceRef.current += 1;
-            const result = await runCommand({
-                commandId: `image:${pinnedDocumentId}:${commandSequenceRef.current}`,
-                documentId: pinnedDocumentId,
-                baseRevision: pinnedRevision,
-                selection: target,
-                kind: "insert-image",
-                image: { src: stored.url, alt: stored.altText },
-            });
-
-            if (!result.ok) return;
-
-            expectedMarkdown = markdownRef.current;
-            target = advancePinnedSelection(
-                target,
-                expectedMarkdown.length - before.length,
-            );
+        } catch (error) {
+            // Nothing above expects to throw, but the handlers only `void`
+            // this promise: whatever does must still reach the user.
+            fail(reached, describeImageStoreError(error));
+        } finally {
+            clearTimeout(showTimer);
+            imageBatchesRef.current.delete(batchId);
+            refreshImageProgress();
         }
-    }, [currentSelection, runCommand]);
+    }, [currentSelection, refreshImageProgress, reportImageFailure, runCommand]);
 
     const handlePasteCapture = useCallback(
         (event: ClipboardEvent<HTMLDivElement>) => {
@@ -733,9 +889,7 @@ export const MarkdownEditorSurface = forwardRef<
 
             event.preventDefault();
             event.stopPropagation();
-            void storeAndInsertImages(imageFiles).catch((error) => {
-                console.warn("Failed to store pasted image.", error);
-            });
+            void storeAndInsertImages(imageFiles);
         },
         [storeAndInsertImages],
     );
@@ -760,9 +914,7 @@ export const MarkdownEditorSurface = forwardRef<
 
             event.preventDefault();
             event.stopPropagation();
-            void storeAndInsertImages(imageFiles).catch((error) => {
-                console.warn("Failed to store dropped image.", error);
-            });
+            void storeAndInsertImages(imageFiles);
         },
         [storeAndInsertImages],
     );
@@ -808,6 +960,15 @@ export const MarkdownEditorSurface = forwardRef<
                     className="shrink-0 border-b border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm"
                 >
                     {modeRefusal.message}
+                </div>
+            ) : null}
+            {imageProgress !== null ? (
+                <div
+                    data-mdx-image-notice="progress"
+                    role="status"
+                    className="shrink-0 border-b border-[var(--mdx-separator)] px-3 py-2 text-sm text-base-content/70"
+                >
+                    {`正在处理图片 ${Math.min(imageProgress.done + 1, imageProgress.total)}/${imageProgress.total}…`}
                 </div>
             ) : null}
             <div

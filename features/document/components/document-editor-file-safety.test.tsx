@@ -459,6 +459,29 @@ describe("document file safety with the adapter surface", () => {
     expect(draftDelete).not.toHaveBeenCalled();
   });
 
+  it("tells the user when an image could not be stored, and writes nothing", async () => {
+    readDocumentFile.mockResolvedValue(
+      documentFile(DISK_MARKDOWN, "fingerprint-disk"),
+    );
+    imageStorage.storeImageForDocument.mockRejectedValueOnce({
+      error_code: "image_host_upload_failed",
+      message: "GitHub HTTP 401: Bad credentials",
+    });
+    await mountDocument();
+
+    const file = new File(["image-bytes"], "clip.png", { type: "image/png" });
+    await act(async () => {
+      transferImage(surface(), "paste", file);
+      await flushPromises();
+    });
+
+    const notice = document.querySelector("[data-mdx-image-notice='failed']");
+    expect(notice?.textContent).toContain(
+      "图片未插入：GitHub HTTP 401: Bad credentials",
+    );
+    expect(document.body.textContent).not.toContain("clip.png](");
+  });
+
   it.each([
     { name: "pasted", how: "paste" as const },
     { name: "dropped", how: "drop" as const },

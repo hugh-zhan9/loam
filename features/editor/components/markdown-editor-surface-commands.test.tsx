@@ -9,6 +9,7 @@ import {
     type EditorCommandRefusal,
     type MarkdownEditorSurfaceHandle,
 } from "./markdown-editor-surface";
+import { ImageFailureBar } from "./image-failure-bar";
 import {
     createEditorSessionBinding,
     type EditorSessionBinding,
@@ -54,6 +55,11 @@ interface Controls {
     ): void;
     queueCli(command: PendingCliEditorCommand): void;
     markdownOf(documentId: string): string | undefined;
+    /**
+     * Takes the editor surface off screen, as a shell does when the last tab
+     * closes or a non-Markdown tab is shown; the host itself stays.
+     */
+    unmountSurface(): void;
 }
 
 interface Harness {
@@ -105,6 +111,9 @@ function SessionHost({
     const [documentId, setDocumentId] = useState(initialDocumentId);
     const [pendingCliCommand, setPendingCliCommand] =
         useState<PendingCliEditorCommand | null>(null);
+    const [surfaceMounted, setSurfaceMounted] = useState(true);
+    // Shown by the host, as the shells show it.
+    const [imageFailure, setImageFailure] = useState<string | null>(null);
     const documentsRef = useRef(documents);
 
     useEffect(() => {
@@ -117,6 +126,7 @@ function SessionHost({
             },
             queueCli: setPendingCliCommand,
             markdownOf: (targetId) => documentsRef.current[targetId],
+            unmountSurface: () => setSurfaceMounted(false),
         };
     }, [binding, controlsRef, documents]);
 
@@ -129,36 +139,47 @@ function SessionHost({
     );
 
     return (
-        <MarkdownEditorSurface
-            ref={surfaceRef}
-            session={binding}
-            documentId={documentId}
-            markdown={documents[documentId] ?? ""}
-            initialMode={initialMode}
-            storeImage={storeImage}
-            pendingCliCommand={
-                pendingCliCommand?.tabId === documentId ? pendingCliCommand : null
-            }
-            onPendingCliCommandHandled={(commandId) => {
-                handledCommandIds.push(commandId);
-                setPendingCliCommand((current) =>
-                    current?.id === commandId ? null : current,
-                );
-            }}
-            onCommandRefused={(refusal) => refusals.push(refusal)}
-            onSelectionChange={(changedDocumentId, selection) => {
-                selections.push({
-                    documentId: changedDocumentId,
-                    selection: selection as CliSelectionSnapshot | null,
-                });
-            }}
-            onMarkdownChange={(changedDocumentId, markdown) => {
-                setDocuments((current) => ({
-                    ...current,
-                    [changedDocumentId]: markdown,
-                }));
-            }}
-        />
+        <>
+            <ImageFailureBar
+                message={imageFailure}
+                onDismiss={() => setImageFailure(null)}
+            />
+            {surfaceMounted ? (
+                <MarkdownEditorSurface
+                    ref={surfaceRef}
+                    session={binding}
+                    documentId={documentId}
+                    markdown={documents[documentId] ?? ""}
+                    initialMode={initialMode}
+                    storeImage={storeImage}
+                    onImageFailure={setImageFailure}
+                    pendingCliCommand={
+                        pendingCliCommand?.tabId === documentId
+                            ? pendingCliCommand
+                            : null
+                    }
+                    onPendingCliCommandHandled={(commandId) => {
+                        handledCommandIds.push(commandId);
+                        setPendingCliCommand((current) =>
+                            current?.id === commandId ? null : current,
+                        );
+                    }}
+                    onCommandRefused={(refusal) => refusals.push(refusal)}
+                    onSelectionChange={(changedDocumentId, selection) => {
+                        selections.push({
+                            documentId: changedDocumentId,
+                            selection: selection as CliSelectionSnapshot | null,
+                        });
+                    }}
+                    onMarkdownChange={(changedDocumentId, markdown) => {
+                        setDocuments((current) => ({
+                            ...current,
+                            [changedDocumentId]: markdown,
+                        }));
+                    }}
+                />
+            ) : null}
+        </>
     );
 }
 
@@ -269,6 +290,31 @@ function pasteImages(harness: Harness, files: File[]): void {
         value: { files, items: [], types: ["Files"], getData: () => "" },
     });
     target.dispatchEvent(event);
+}
+
+/** Delivers a drop the way a browser does, with the files on its transfer. */
+function dropImages(harness: Harness, files: File[]): void {
+    const target = harness.container.querySelector(
+        "[data-mdx-markdown-editor-stage]",
+    );
+    if (!target) throw new Error("no editor stage to drop onto");
+
+    const event = new Event("drop", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "dataTransfer", {
+        value: { files, items: [], types: ["Files"], getData: () => "" },
+    });
+    target.dispatchEvent(event);
+}
+
+function imageNotice(harness: Harness): HTMLElement | null {
+    return harness.container.querySelector("[data-mdx-image-notice]");
+}
+
+/** Real time passing, for the delay before a running batch is shown. */
+async function wait(ms: number): Promise<void> {
+    await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, ms));
+    });
 }
 
 /**
@@ -630,5 +676,287 @@ describe("editor command suite — pinned range validation", () => {
         // revealed at a substitute line.
         expect(harness.handledCommandIds).toEqual(["cli-scroll-missing"]);
         expect(harness.selections).toEqual([]);
+    });
+});
+
+describe("editor command suite — image notices", () => {
+    const DOCUMENT = "# Alpha\n\nalpha beta\n\ntail\n";
+
+    async function pastedAt(files: File[]) {
+        const harness = await mountSession({ doc: DOCUMENT }, "doc", "wysiwyg");
+        const origin = DOCUMENT.indexOf("beta");
+        await act(async () => {
+            await harness.handle.reveal({ anchor: origin, head: origin });
+        });
+        await act(async () => {
+            pasteImages(harness, files);
+        });
+        expect(harness.imageRequests).toHaveLength(1);
+        return harness;
+    }
+
+    it("says why a stored image failed and leaves the document as it was", async () => {
+        const harness = await pastedAt([imageFile("shot.png")]);
+
+        await act(async () => {
+            // The shape a Tauri command rejects with.
+            harness.imageRequests[0].reject({
+                error_code: "image_host_upload_failed",
+                message: "could not reach the PicGo server",
+            });
+        });
+        await harness.settle();
+
+        const notice = imageNotice(harness);
+        expect(notice?.getAttribute("data-mdx-image-notice")).toBe("failed");
+        expect(notice?.getAttribute("role")).toBe("alert");
+        expect(notice?.textContent).toContain(
+            "图片未插入：could not reach the PicGo server",
+        );
+        expect(notice?.textContent).not.toContain("张未插入");
+        expect(harness.controls.markdownOf("doc")).toBe(DOCUMENT);
+        expect(harness.refusals).toEqual([]);
+    });
+
+    it("stops a batch at the first failure and says how many did not land", async () => {
+        const harness = await pastedAt([
+            imageFile("one.png"),
+            imageFile("two.png"),
+            imageFile("three.png"),
+        ]);
+
+        await act(async () => {
+            harness.imageRequests[0].resolve({
+                url: "https://img.example/one.png",
+                altText: "one",
+            });
+        });
+        await harness.settle();
+        expect(harness.imageRequests).toHaveLength(2);
+
+        await act(async () => {
+            harness.imageRequests[1].reject(new Error("HTTP 403"));
+        });
+        await harness.settle();
+
+        // The third was never attempted.
+        expect(harness.imageRequests).toHaveLength(2);
+        expect(insertedMarkdown(harness)).toContain(
+            "![one](https://img.example/one.png)",
+        );
+        expect(insertedMarkdown(harness)).not.toContain("two");
+        expect(imageNotice(harness)?.textContent).toContain(
+            "图片未插入：HTTP 403（本次共 2 张未插入）",
+        );
+    });
+
+    it("tells the user when a stored image was refused because its document is gone", async () => {
+        const harness = await mountSession(
+            { doc: DOCUMENT, other: "other document\n" },
+            "doc",
+            "wysiwyg",
+        );
+        await act(async () => {
+            pasteImages(harness, [imageFile("shot.png")]);
+        });
+        await act(async () => {
+            harness.controls.show("other");
+            harness.binding.retain(["other"]);
+        });
+
+        await act(async () => {
+            harness.imageRequests[0].resolve({
+                url: "https://img.example/shot.png",
+                altText: "shot",
+            });
+        });
+        await harness.settle();
+
+        expect(harness.refusals.map((refusal) => refusal.code)).toEqual([
+            "stale_document",
+        ]);
+        expect(imageNotice(harness)?.textContent).toContain(
+            "图片未插入：粘贴时的文档已不在编辑器中",
+        );
+        expect(harness.controls.markdownOf("other")).toBe("other document\n");
+    });
+
+    it("still tells the user when the surface was unmounted while the image was stored", async () => {
+        const harness = await pastedAt([imageFile("shot.png")]);
+
+        // The last tab closed, or an image tab was opened: the shell stays,
+        // the surface does not.
+        await act(async () => {
+            harness.controls.unmountSurface();
+        });
+        expect(harness.container.querySelector(".ProseMirror")).toBeNull();
+
+        await act(async () => {
+            harness.imageRequests[0].resolve({
+                url: "https://img.example/shot.png",
+                altText: "shot",
+            });
+        });
+        await harness.settle();
+
+        expect(harness.refusals.map((refusal) => refusal.code)).toEqual([
+            "stale_document",
+        ]);
+        expect(imageNotice(harness)?.textContent).toContain(
+            "图片未插入：粘贴时的文档已不在编辑器中",
+        );
+    });
+
+    it("names an edit made between two images of a batch as the reason the rest stopped", async () => {
+        const harness = await pastedAt([imageFile("one.png"), imageFile("two.png")]);
+
+        await act(async () => {
+            harness.imageRequests[0].resolve({
+                url: "https://img.example/one.png",
+                altText: "one",
+            });
+        });
+        await harness.settle();
+        expect(harness.imageRequests).toHaveLength(2);
+
+        // Something other than the batch changes the document before the
+        // second image is ready.
+        await act(async () => {
+            harness.controls.queueCli({
+                id: "cli-insert-during-batch",
+                kind: "insert",
+                tabId: "doc",
+                text: "TYPED-",
+            });
+        });
+        await harness.settle();
+
+        await act(async () => {
+            harness.imageRequests[1].resolve({
+                url: "https://img.example/two.png",
+                altText: "two",
+            });
+        });
+        await harness.settle();
+
+        expect(insertedMarkdown(harness)).not.toContain("two.png");
+        expect(imageNotice(harness)?.textContent).toContain(
+            "图片未插入：插入过程中文档被修改（本次共 1 张未插入）",
+        );
+    });
+
+    it("stores a dropped image the same way as a pasted one", async () => {
+        const harness = await mountSession({ doc: DOCUMENT }, "doc", "wysiwyg");
+        const origin = DOCUMENT.indexOf("beta");
+        await act(async () => {
+            await harness.handle.reveal({ anchor: origin, head: origin });
+        });
+
+        await act(async () => {
+            dropImages(harness, [imageFile("dropped.png")]);
+        });
+        expect(harness.imageRequests).toHaveLength(1);
+        expect(harness.imageRequests[0].file.name).toBe("dropped.png");
+
+        await act(async () => {
+            harness.imageRequests[0].resolve({
+                url: "https://img.example/dropped.png",
+                altText: "dropped",
+            });
+        });
+        await harness.settle();
+
+        expect(insertedMarkdown(harness)).toContain(
+            "alpha ![dropped](https://img.example/dropped.png)beta",
+        );
+    });
+
+    it("shows a batch as running only once it has run long enough, and hides it when done", async () => {
+        const harness = await pastedAt([imageFile("slow.png")]);
+
+        expect(imageNotice(harness)).toBeNull();
+        await wait(350);
+        const notice = imageNotice(harness);
+        expect(notice?.getAttribute("data-mdx-image-notice")).toBe("progress");
+        expect(notice?.getAttribute("role")).toBe("status");
+        expect(notice?.textContent).toBe("正在处理图片 1/1…");
+
+        await act(async () => {
+            harness.imageRequests[0].resolve({
+                url: "https://img.example/slow.png",
+                altText: "slow",
+            });
+        });
+        await harness.settle();
+
+        expect(imageNotice(harness)).toBeNull();
+    });
+
+    it("shows a running batch only over the document it was pasted into", async () => {
+        const harness = await mountSession(
+            { doc: DOCUMENT, other: "other document\n" },
+            "doc",
+            "wysiwyg",
+        );
+        await act(async () => {
+            pasteImages(harness, [imageFile("slow.png")]);
+        });
+        await wait(350);
+        expect(imageNotice(harness)?.textContent).toBe("正在处理图片 1/1…");
+
+        // That batch can no longer land here, and its progress would say it can.
+        await act(async () => {
+            harness.controls.show("other");
+        });
+        expect(imageNotice(harness)).toBeNull();
+
+        await act(async () => {
+            harness.controls.show("doc");
+        });
+        expect(imageNotice(harness)?.textContent).toBe("正在处理图片 1/1…");
+    });
+
+    it("never shows a store that finishes quickly", async () => {
+        const harness = await pastedAt([imageFile("quick.png")]);
+
+        await act(async () => {
+            harness.imageRequests[0].resolve({
+                url: ".assets/quick.png",
+                altText: "quick",
+            });
+        });
+        await harness.settle();
+        await wait(350);
+
+        expect(imageNotice(harness)).toBeNull();
+    });
+
+    it("keeps a failure until it is closed or the next paste starts", async () => {
+        const harness = await pastedAt([imageFile("a.png")]);
+        await act(async () => {
+            harness.imageRequests[0].reject(new Error("first failure"));
+        });
+        await harness.settle();
+
+        const close = imageNotice(harness)?.querySelector("button");
+        expect(close?.textContent).toBe("关闭");
+        await act(async () => {
+            close?.click();
+        });
+        expect(imageNotice(harness)).toBeNull();
+
+        await act(async () => {
+            pasteImages(harness, [imageFile("b.png")]);
+        });
+        await act(async () => {
+            harness.imageRequests[1].reject(new Error("second failure"));
+        });
+        await harness.settle();
+        expect(imageNotice(harness)?.textContent).toContain("second failure");
+
+        await act(async () => {
+            pasteImages(harness, [imageFile("c.png")]);
+        });
+        expect(imageNotice(harness)).toBeNull();
     });
 });

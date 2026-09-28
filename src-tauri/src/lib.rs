@@ -23,6 +23,7 @@ mod document;
 mod draft_store;
 mod external_url;
 mod file_watch;
+mod image_host;
 mod llm_wiki;
 mod llm_wiki_context;
 mod llm_wiki_fs;
@@ -42,6 +43,7 @@ pub mod memory_hooks;
 pub mod memory_models;
 mod models;
 mod path_guard;
+mod secret_config_file;
 mod state_store;
 mod user_themes;
 mod window_appearance;
@@ -1454,6 +1456,9 @@ pub fn run() {
             assets::save_image_asset,
             assets::save_document_image_asset,
             assets::load_image_asset,
+            image_host::image_host_config_get,
+            image_host::image_host_config_update,
+            image_host::upload_image_to_host,
             background::save_background_image,
             background::load_background_image,
             background::clear_background_image,

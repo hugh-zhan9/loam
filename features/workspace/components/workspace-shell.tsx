@@ -215,6 +215,8 @@ export function WorkspaceShell({
     "editor",
   );
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Outlives the editor stage, which the Memory and LLM Wiki views replace.
+  const [imageFailure, setImageFailure] = useState<string | null>(null);
   /**
    * Which surface the editor settled on, as reported by the editor.
    *
@@ -2751,6 +2753,8 @@ export function WorkspaceShell({
             onPendingCliCommandHandled={handlePendingCliCommandHandled}
             onSelectionChange={handleSelectionChange}
             onModeChange={setEditorMode}
+            imageFailure={imageFailure}
+            onImageFailure={setImageFailure}
           />
           {/*
            * Only for a document whose text is actually in hand: a tab still

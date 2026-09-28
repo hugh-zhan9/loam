@@ -12,6 +12,10 @@ import {
 } from "@/features/llm-wiki/lib/llm-wiki-client";
 import { MemorySettingsSection } from "@/features/memory/components/memory-settings-section";
 import {
+  ImageHostSettingsSection,
+  useImageHostSettings,
+} from "./image-host-settings-section";
+import {
   getWorkspaceConfig,
   setWorkspaceConfig,
 } from "@/features/memory/lib/memory-client";
@@ -102,9 +106,11 @@ function SettingsDialog({
   const sectionRefs = useRef<Record<SettingsSection, HTMLElement | null>>({
     search: null,
     files: null,
+    imageHost: null,
     memory: null,
     llm: null,
   });
+  const imageHost = useImageHostSettings();
   const [baseUrl, setBaseUrl] = useState("https://api.openai.com/v1");
   const [model, setModel] = useState("gpt-4.1-mini");
   const [apiMode, setApiMode] = useState<LlmProviderApiMode>("chat");
@@ -302,6 +308,10 @@ function SettingsDialog({
         ),
       };
 
+      // First, so that an image host refused as incomplete stops the save
+      // before anything else has been written.
+      await imageHost.save();
+
       if (!appPreferencesEqual(nextPreferences, preferences)) {
         await onPreferencesChange?.(nextPreferences);
       }
@@ -459,6 +469,7 @@ function SettingsDialog({
                   onClick={() => void saveSettings()}
                   disabled={
                     loadingConfig ||
+                    imageHost.loading ||
                     savingSettings ||
                     !baseUrl.trim() ||
                     !model.trim()
@@ -554,6 +565,14 @@ function SettingsDialog({
                 </div>
               </PanelSection>
             </div>
+
+            <ImageHostSettingsSection
+              sectionRef={(node) => {
+                sectionRefs.current.imageHost = node;
+              }}
+              settings={imageHost}
+              disabled={savingSettings}
+            />
 
             <MemorySettingsSection
               sectionRef={(node) => {
@@ -734,11 +753,12 @@ const LLM_API_MODE_OPTIONS: Array<{
  * Appearance is not here: it lives on the title bar, where the window it changes
  * is in view. See `appearance-button.tsx`.
  */
-type SettingsSection = "search" | "files" | "memory" | "llm";
+type SettingsSection = "search" | "files" | "imageHost" | "memory" | "llm";
 
 const SETTINGS_SECTIONS: Array<{ id: SettingsSection; label: string }> = [
   { id: "search", label: "搜索" },
   { id: "files", label: "文件" },
+  { id: "imageHost", label: "图床" },
   { id: "memory", label: "Memory" },
   { id: "llm", label: "LLM" },
 ];

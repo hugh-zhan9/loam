@@ -80,6 +80,8 @@ Outline, wikilinks, find/replace, images, and CLI focus/selection/insert use the
 
 Delayed text/image commands pin document identity, revision, and selection at receipt. Intervening local transactions may map that selection forward. A clean reload, restore, conflict resolution, closed tab, or other untrustworthy replacement rejects the command instead of inserting at the current caret.
 
+A pasted or dropped image that cannot be stored or inserted is reported to the user, with the reason and, for a batch, how many images did not land. The surface words the message and hands it to its caller through `onImageFailure`; the shell shows it, because the surface may be unmounted by then (the tab was closed or switched away from while the image was stored); the batch stops at the first such image and those already inserted stay. The surface does not decide where an image is stored: the caller's `storeImage` does, and when the image host is enabled a failed upload is reported, never saved locally instead (`docs/loopx/design/2026-09-28-image-host-upload/`).
+
 The public CLI command names, flags, payloads, stdout/stderr behavior, JSON output, and exit codes remain unchanged by the editor migration.
 
 Wikilink activation reports both halves of what the syntax layer parsed — the target and the alias, the alias being null when the link has none. The parser already has both; dropping one at the boundary leaves a caller unable to name the link the way the document does.

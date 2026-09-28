@@ -5,6 +5,7 @@ import type { ReactNode, RefObject } from "react";
 import { loadImage, storeImageForWorkspace } from "@/common/lib/image-storage";
 import { tokenize } from "@/common/lib/prism";
 import { tauriCore } from "@/common/lib/tauri";
+import { ImageFailureBar } from "@/features/editor/components/image-failure-bar";
 import { MarkdownEditorSurface } from "@/features/editor/components/markdown-editor-surface";
 import type {
   EditorCommandRefusal,
@@ -57,6 +58,16 @@ interface EditorStageProps {
   ) => void;
   /** Passed straight through: which surface the editor settled on. */
   onModeChange?: (mode: EditorSurfaceMode) => void;
+  /**
+   * Why the images last pasted did not all land, shown above whatever the
+   * stage is showing.
+   *
+   * Held by the caller, not here: the Memory and LLM Wiki views replace this
+   * whole stage, and an image refused while one of them is open must still be
+   * reported when the editor comes back.
+   */
+  imageFailure: string | null;
+  onImageFailure: (message: string | null) => void;
 }
 
 export function EditorStage({
@@ -73,11 +84,22 @@ export function EditorStage({
   onPendingCliCommandHandled,
   onSelectionChange,
   onModeChange,
+  imageFailure,
+  onImageFailure,
 }: EditorStageProps) {
   const [loadError, setLoadError] = useState<{
     tabId: string;
     text: string;
   } | null>(null);
+  // Shown by the stage rather than the editor surface, which is unmounted
+  // when the last tab closes or a non-Markdown tab is shown — the very moments
+  // an image still being stored is refused.
+  const imageFailureBar = (
+    <ImageFailureBar
+      message={imageFailure}
+      onDismiss={() => onImageFailure(null)}
+    />
+  );
 
   useEffect(() => {
     if (
@@ -150,14 +172,17 @@ export function EditorStage({
     return (
       <section
         data-mdx-content-surface=""
-        className="flex min-h-0 flex-1 items-center justify-center bg-base-100 px-6"
+        className="flex min-h-0 flex-1 flex-col bg-base-100"
       >
-        <EmptyState
-          title={emptyState.title}
-          description={emptyState.description}
-          actionLabel={emptyState.actionLabel}
-          onAction={onCreateMarkdownFile}
-        />
+        {imageFailureBar}
+        <div className="flex min-h-0 flex-1 items-center justify-center px-6">
+          <EmptyState
+            title={emptyState.title}
+            description={emptyState.description}
+            actionLabel={emptyState.actionLabel}
+            onAction={onCreateMarkdownFile}
+          />
+        </div>
       </section>
     );
   }
@@ -174,6 +199,7 @@ export function EditorStage({
       data-mdx-content-surface=""
       className="flex min-h-0 flex-1 flex-col bg-base-100"
     >
+      {imageFailureBar}
       <div className="min-h-0 flex-1 overflow-hidden">
         {activeTabKind === "pdf" ? (
           <BinaryBlobPreview
@@ -237,6 +263,7 @@ export function EditorStage({
                 currentFilePath: activeTab.path,
               })
             }
+            onImageFailure={onImageFailure}
             services={{
               // A relative asset is relative to the file that names it, which
               // is a fact about the workspace and not about the editor.
