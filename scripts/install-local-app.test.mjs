@@ -34,11 +34,13 @@ beforeEach(() => {
 afterEach(() => rmSync(folder, { recursive: true, force: true }));
 
 describe("local app installation", () => {
-  it("verifies the new bundle before replacing the old app, which remains available as a backup", async () => {
+  it("verifies the new bundle before replacing the old app, and leaves nothing of the old app behind", async () => {
     const result = await installLocalApp({ sourceApp, destinationApp });
-    expect(binary(destinationApp)).toBe("new");
-    expect(binary(result.backupApp)).toBe("old");
+    expect(binary(result.destinationApp)).toBe("new");
     expect(binary(sourceApp)).toBe("new");
+    // No hidden `.loam-install-*` folder, and no copy of the old app, beside
+    // the installed one.
+    expect(readdirSync(folder).sort()).toEqual(["Loam.app", "built.app"]);
     expect(spawnSync.mock.calls.filter(([name]) => name === "codesign").map(([, args]) => args[0])).toEqual(["--force", "--verify"]);
     expect(spawnSync.mock.calls.some(([name]) => name === "osascript")).toBe(false);
   });
@@ -120,10 +122,25 @@ describe("local app installation", () => {
     expect(readdirSync(folder).sort()).toEqual(["Loam.app", "built.app"]);
   });
 
+  it("keeps the old app where it is when it cannot be put back", async () => {
+    // The only copy of the old app is then the one in the staging folder, so
+    // that folder must survive the failure.
+    vi.mocked(renameSync).mockImplementation((source, destination) => {
+      if (source.endsWith("next.app")) throw new Error("replacement failed");
+      if (source.endsWith("previous.app")) throw new Error("restore failed");
+      return actualFs.renameSync(source, destination);
+    });
+
+    await expect(installLocalApp({ sourceApp, destinationApp })).rejects.toThrow("restore failed");
+
+    const staging = readdirSync(folder).filter((name) => name.startsWith(".loam-install-"));
+    expect(staging).toHaveLength(1);
+    expect(binary(join(folder, staging[0], "previous.app"))).toBe("old");
+  });
+
   it("installs on a machine without an existing app", async () => {
     rmSync(destinationApp, { recursive: true });
-    const result = await installLocalApp({ sourceApp, destinationApp });
-    expect(result.backupApp).toBeNull();
+    await installLocalApp({ sourceApp, destinationApp });
     expect(existsSync(destinationApp)).toBe(true);
     expect(readdirSync(folder).sort()).toEqual(["Loam.app", "built.app"]);
   });

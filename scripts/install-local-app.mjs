@@ -137,6 +137,9 @@ export async function installLocalApp({ sourceApp, destinationApp, onRunning = p
 
   // Prepare and verify beside the destination so replacement uses same-volume
   // renames. A copy or signing failure cannot remove the installed application.
+  // The folder is gone again when this returns: it used to keep each replaced
+  // app as a backup, and every install left one more hidden folder in
+  // /Applications.
   const staging = mkdtempSync(join(dirname(destinationApp), ".loam-install-"));
   const nextApp = join(staging, "next.app");
   const previousApp = join(staging, "previous.app");
@@ -161,8 +164,7 @@ export async function installLocalApp({ sourceApp, destinationApp, onRunning = p
     renameSync(nextApp, destinationApp);
     installed = true;
     console.log(`Installed ${sourceApp} -> ${destinationApp}`);
-    if (hasBackup) console.log(`Previous app: ${previousApp}`);
-    return { destinationApp, backupApp: hasBackup ? previousApp : null };
+    return { destinationApp };
   } catch (error) {
     // The replacement rename can fail after moving the old bundle aside.
     if (hasBackup && !installed) {
@@ -171,7 +173,18 @@ export async function installLocalApp({ sourceApp, destinationApp, onRunning = p
     }
     throw error;
   } finally {
-    if (!hasBackup) rmSync(staging, { recursive: true, force: true });
+    // Kept only when it holds the one copy of the old app there is: the new
+    // bundle could not be placed and putting the old one back failed too.
+    if (installed || !hasBackup) {
+      try {
+        rmSync(staging, { recursive: true, force: true });
+      } catch (error) {
+        if (!installed) throw error;
+        // The new app is in place; a folder that would not go is not a
+        // failed install.
+        console.warn(`Installed, but could not remove ${staging}: ${error.message}`);
+      }
+    }
   }
 }
 
