@@ -31,6 +31,14 @@ notes.
 
 Only `.md` and `.markdown` are opened and listed.
 
+In the Workspace toolbar, use **Import Markdown Folder** to preview a local
+export folder. Loam lists the files it can add, destination conflicts it will
+skip, and missing relative attachments. Cancel leaves the workspace unchanged.
+Confirming copies Markdown and supported linked files without rewriting their
+relative paths or overwriting existing files. If a linked attachment collides,
+the dependent note is skipped rather than pointing to a different file. This
+imports a folder you already exported; it does not access the Apple Notes database.
+
 ## The workspace
 
 Three columns, left to right:

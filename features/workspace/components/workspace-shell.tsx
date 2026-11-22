@@ -22,6 +22,7 @@ import {
 import type { ReactNode } from "react";
 import { nanoid } from "nanoid";
 import { tauriCore } from "@/common/lib/tauri";
+import { MarkdownImportControl } from "./markdown-import-control";
 import { useFileWatch } from "@/features/file-watch/hooks/use-file-watch";
 import { DocumentStatusBar } from "@/features/editor/components/document-status-bar";
 import { createEditorSessionBinding } from "@/features/editor/lib/editor-session-binding";
@@ -2416,6 +2417,9 @@ export function WorkspaceShell({
               label="打开文件夹"
               icon={<FolderOpen />}
             />
+            {canChooseWorkspace ? (
+              <MarkdownImportControl key={workspace.rootPath} rootPath={workspace.rootPath} refresh={refreshCurrentTree} />
+            ) : null}
             <IconButton
               onClick={printActiveDocument}
               disabled={!isEditorView || !activeTabIsLoadedMarkdown}

@@ -36,6 +36,7 @@ mod llm_wiki_query;
 mod llm_wiki_raw;
 #[cfg(target_os = "macos")]
 mod macos_launch;
+mod markdown_import;
 pub mod memory;
 pub mod memory_agent_setup;
 pub mod memory_config;
@@ -1534,6 +1535,8 @@ pub fn run() {
             workspace_search::workspace_search,
             workspace_search::workspace_search_cancel,
             workspace_fs::scan_workspace,
+            markdown_import::preview_markdown_import,
+            markdown_import::apply_markdown_import,
             workspace_fs::workspace_note_page,
             workspace_fs::read_markdown_file,
             workspace_fs::read_preview_text_file,
