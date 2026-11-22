@@ -127,20 +127,81 @@ fn load_image_asset_impl(
     src: String,
     global_assets_dir: Option<&Path>,
 ) -> Result<LoadImageAssetResult, WorkspaceError> {
-    let image_extension = image_extension(&src)?;
-    let src_path = Path::new(&src);
-    let root = root_path
-        .as_deref()
-        .map(canonicalize_workspace_root)
-        .transpose()?;
-    let document_asset_parent = if root.is_none() && !src_path.is_absolute() {
-        Some(canonical_document_asset_parent(
+    let load = |candidate: &str| {
+        load_image_candidate(
+            root_path.as_deref(),
             current_file_path.as_deref(),
-        )?)
+            candidate,
+            global_assets_dir,
+        )
+    };
+    if let Some(relative) = markdown_image_path(&src) {
+        let drive_prefix = relative
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic)
+            && relative.as_bytes().get(1) == Some(&b':');
+        if Path::new(&relative).has_root()
+            || relative.starts_with('\\')
+            || drive_prefix
+            || relative.contains('\0')
+        {
+            return Err(WorkspaceError::new(
+                "invalid_name",
+                "invalid relative Markdown image path",
+            ));
+        }
+        match load(&relative) {
+            // Older notes can contain a literal percent escape in the filename.
+            // Never fall back when a decoded path fails a location/permission check.
+            Err(error) if error.error_code() == "not_found" && image_extension(&src).is_ok() => {}
+            result => return result,
+        }
+    }
+    load(&src)
+}
+
+/// Markdown destinations are URLs, but absolute asset paths are filesystem paths.
+/// Split URL suffixes before a single percent decode so escaped punctuation stays
+/// in the filename. Plain and malformed legacy filenames retain their old lookup.
+fn markdown_image_path(src: &str) -> Option<String> {
+    if Path::new(src).has_root() {
+        return None;
+    }
+    let path = src.split(['?', '#']).next()?;
+    if path.is_empty() || (path == src && !path.contains('%')) {
+        return None;
+    }
+
+    let mut bytes = path.bytes();
+    let mut decoded = Vec::with_capacity(path.len());
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let high = char::from(bytes.next()?).to_digit(16)?;
+            let low = char::from(bytes.next()?).to_digit(16)?;
+            decoded.push(((high << 4) | low) as u8);
+        } else {
+            decoded.push(byte);
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn load_image_candidate(
+    root_path: Option<&str>,
+    current_file_path: Option<&str>,
+    src: &str,
+    global_assets_dir: Option<&Path>,
+) -> Result<LoadImageAssetResult, WorkspaceError> {
+    let image_extension = image_extension(src)?;
+    let src_path = Path::new(src);
+    let root = root_path.map(canonicalize_workspace_root).transpose()?;
+    let document_asset_parent = if root.is_none() && !src_path.is_absolute() {
+        Some(canonical_document_asset_parent(current_file_path)?)
     } else {
         None
     };
-    let candidate = resolve_image_candidate(root.as_deref(), current_file_path.as_deref(), &src)?;
+    let candidate = resolve_image_candidate(root.as_deref(), current_file_path, src)?;
     let image_path = fs::canonicalize(&candidate).map_err(|error| {
         let code = if error.kind() == std::io::ErrorKind::NotFound {
             "not_found"

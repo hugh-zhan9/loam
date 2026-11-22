@@ -259,6 +259,58 @@ mod tests {
     }
 
     #[test]
+    fn copied_markdown_opens_its_url_encoded_relative_image() {
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let s = source.path().to_str().unwrap();
+        let d = dest.path().to_str().unwrap();
+        let note_path = "nested/note.md";
+        let image_path = ".assets/photo one.png";
+        let markdown = b"![photo](../.assets/photo%20one.png?rev=2#caption)\n";
+        fs::create_dir(source.path().join("nested")).unwrap();
+        fs::create_dir(source.path().join(".assets")).unwrap();
+        fs::write(source.path().join(note_path), markdown).unwrap();
+        let mut png = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png, 1, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[17, 33, 51, 255]).unwrap();
+        }
+        fs::write(source.path().join(image_path), &png).unwrap();
+
+        let paths = preview(s, d)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect();
+        let dependencies = HashMap::from([(note_path.into(), vec![image_path.into()])]);
+        assert_eq!(
+            apply(s, d, paths, dependencies).unwrap().added,
+            vec![image_path, note_path]
+        );
+        assert_eq!(fs::read(dest.path().join(note_path)).unwrap(), markdown);
+        for src in [
+            "../.assets/photo one.png",
+            "../.assets/photo%20one.png",
+            "../.assets/photo%20one.png?rev=2#caption",
+        ] {
+            let loaded = crate::assets::load_image_asset(
+                Some(d.into()),
+                Some(note_path.into()),
+                src.into(),
+            ).unwrap_or_else(|error| panic!("{src}: {error}"));
+            assert_eq!(loaded.mime_type, "image/png");
+            assert_eq!(loaded.bytes, png);
+            let mut reader = png::Decoder::new(loaded.bytes.as_slice()).read_info().unwrap();
+            let mut pixels = vec![0; reader.output_buffer_size()];
+            let frame = reader.next_frame(&mut pixels).unwrap();
+            assert_eq!(&pixels[..frame.buffer_size()], &[17, 33, 51, 255]);
+        }
+    }
+
+    #[test]
     fn skips_source_symlinks_and_does_not_follow_destination_symlinks() {
         let source = tempfile::tempdir().unwrap();
         let dest = tempfile::tempdir().unwrap();

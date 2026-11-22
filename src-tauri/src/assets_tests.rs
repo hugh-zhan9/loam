@@ -258,6 +258,68 @@ fn loads_allowed_workspace_asset_image() {
 }
 
 #[test]
+fn relative_image_url_decodes_once_and_preserves_legacy_paths() {
+    let root = tempdir().unwrap();
+    let asset_dir = root.path().join(".assets");
+    std::fs::create_dir(&asset_dir).unwrap();
+    let doc = root.path().join("note.md");
+    std::fs::write(&doc, "# Doc").unwrap();
+    for (name, value) in [
+        ("画 #?+%.png", 1),
+        ("photo%20one.png", 2),
+        ("photo one.png", 3),
+        ("only%20literal.png", 4),
+        ("raw%word.png", 5),
+    ] {
+        std::fs::write(asset_dir.join(name), [value]).unwrap();
+    }
+    let load = |src: &str| {
+        load_image_asset(None, Some(doc.to_string_lossy().into_owned()), src.into())
+            .unwrap().bytes
+    };
+    for (src, value) in [
+        (".assets/%E7%94%BB%20%23%3F+%25.png#caption", 1),
+        (".assets/photo%2520one.png", 2),
+        (".assets/photo%20one.png", 3),
+        (".assets/only%20literal.png", 4),
+        (".assets/raw%word.png", 5),
+    ] {
+        assert_eq!(load(src), vec![value], "{src}");
+    }
+
+    let absolute = asset_dir.join("photo%20one.png");
+    let loaded = load_image_asset(
+        Some(root.path().to_string_lossy().into_owned()), None,
+        absolute.to_string_lossy().into_owned(),
+    ).unwrap();
+    assert_eq!(loaded.bytes, vec![2]);
+}
+
+#[cfg(unix)]
+#[test]
+fn decoded_relative_images_still_use_workspace_location_checks() {
+    let root = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let secret = outside.path().join("other.png");
+    std::fs::write(&secret, [42]).unwrap();
+    let doc = root.path().join("note.md");
+    std::fs::write(&doc, "# Doc").unwrap();
+    std::os::unix::fs::symlink(&secret, root.path().join("linked image.png")).unwrap();
+    std::fs::write(root.path().join("linked%20image.png"), [24]).unwrap();
+
+    let load = |src: &str| load_image_asset_with_global_assets_dir(
+        Some(root.path().to_string_lossy().into_owned()),
+        Some(doc.to_string_lossy().into_owned()),
+        src.into(),
+        &outside.path().join("global"),
+    );
+    assert_eq!(load("linked%20image.png").unwrap_err().error_code(), "outside_workspace");
+    assert_eq!(load("%2e%2e/other.png").unwrap_err().error_code(), "outside_workspace");
+    assert_eq!(load("%2Fother.png").unwrap_err().error_code(), "invalid_name");
+    assert_eq!(load("bad%00name.png").unwrap_err().error_code(), "invalid_name");
+}
+
+#[test]
 fn rejects_traversal_outside_workspace_for_image_loading() {
     let root = tempdir().unwrap();
     let subdir = root.path().join("docs");
