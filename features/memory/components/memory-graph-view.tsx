@@ -1,14 +1,23 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  Chip,
+  PrimaryTextControlButton,
+  SearchField,
+  SegmentedControl,
+  TextControlButton,
+} from "@/common/components/ui-controls";
 import type { StoredItem } from "../lib/types";
 import {
   buildMemoryGraph,
   documentSource,
   placeGraph,
   type GraphNode,
+  type PlacedNode,
+  type Point,
 } from "../lib/memory-graph";
-import { placeGraph2D } from "../lib/memory-graph-layout";
+import { placeGraph2D, type GraphShape } from "../lib/memory-graph-layout";
 
 interface MemoryGraphViewProps {
   material: StoredItem[];
@@ -18,33 +27,131 @@ interface MemoryGraphViewProps {
 }
 
 const COLORS = {
-  document: "var(--color-primary)",
-  material: "var(--color-info)",
-  verification: "var(--color-accent)",
-  adopted: "var(--color-warning)",
+  verification: "#8b5cf6",
+  adopted: "#d97706",
   candidate:
-    "color-mix(in srgb, var(--color-warning) 65%, var(--color-base-content))",
+    "color-mix(in srgb, var(--color-warning) 72%, var(--color-base-content))",
+};
+const CONSTELLATION_COLORS = [
+  [59, 125, 221], // #3b7ddd
+  [139, 95, 191], // #8b5fbf
+  [217, 95, 102], // #d95f66
+];
+const NODE_KIND_LABELS = {
+  document: "文档",
+  material: "素材",
+  conclusion: "结论",
+  verification: "采纳记录",
 };
 const pixel = (value: number) => Math.round(value * 1000) / 1000;
-const control =
-  "rounded-lg px-3 py-1.5 text-xs text-base-content/80 transition-colors hover:bg-base-content/10 focus-visible:outline-2 focus-visible:outline-primary";
-function color(node: GraphNode) {
-  return node.kind === "conclusion"
-    ? COLORS[
-        node.status === "promoted" || node.status === "canonical"
-          ? "adopted"
-          : "candidate"
-      ]
-    : COLORS[node.kind];
+
+function nodeColor(node: GraphNode, anchor: PlacedNode) {
+  if (node.kind === "conclusion")
+    return node.status === "promoted" || node.status === "canonical"
+      ? COLORS.adopted
+      : COLORS.candidate;
+  if (node.kind === "verification") return COLORS.verification;
+
+  // Start at the top and sweep left through violet, then right through coral.
+  const turn =
+    (((1 - (Math.atan2(anchor.y, anchor.x) + Math.PI / 2) / (2 * Math.PI)) %
+      1) +
+      1) %
+    1;
+  const angle = turn * 3;
+  const stop = Math.min(2, Math.floor(angle));
+  const next = CONSTELLATION_COLORS[(stop + 1) % 3];
+  const channels = CONSTELLATION_COLORS[stop].map((value, i) =>
+    Math.round(value + (next[i] - value) * (angle - stop)),
+  );
+  return `rgb(${channels.join(" ")})`;
 }
 function radius(node: GraphNode) {
   return node.kind === "conclusion"
-    ? 6.5
+    ? 4.6
     : node.kind === "document"
-      ? 3 + Math.min(4, Math.sqrt(node.weight ?? 1) * 0.6)
+      ? 2.7 + Math.min(2.6, Math.sqrt(node.weight ?? 1) * 0.42)
       : node.kind === "verification"
-        ? 3.5
-        : 2;
+        ? 3.0
+        : 2.1;
+}
+
+function buildMeshPairs(
+  placed: PlacedNode[],
+  mode: "2D" | "3D",
+  shape: GraphShape,
+): Array<[number, number]> {
+  const count = placed.length;
+  if (count <= 2) return [];
+  const ring = mode === "2D" && shape === "ring";
+  const maxDistance = ring
+    ? (count < 20 ? 0.65 : 0.36)
+    : mode === "3D"
+      ? (count < 30 ? 1.45 : count < 120 ? 0.95 : 0.62)
+      : (count < 30 ? 1.15 : count < 120 ? 0.72 : 0.48);
+  const maxDistanceSquared = maxDistance ** 2;
+  const maxNeighbors = ring
+    ? (count > 500 ? 2 : count > 250 ? 3 : 4)
+    : (count > 500 ? 3 : count > 250 ? 4 : 6);
+  const avoidCentre = ring && count >= 6;
+  const clusterBias = ring ? 0.55 : 0.65;
+  const seen = new Set<number>();
+  const pairs: Array<[number, number]> = [];
+
+  for (const [i, node] of placed.entries()) {
+    const nearest: Array<{ j: number; score: number }> = [];
+    for (let j = 0; j < placed.length; j++) {
+      if (i === j) continue;
+      const other = placed[j];
+      const dx = other.x - node.x;
+      const dy = other.y - node.y;
+      const dz = other.z - node.z;
+      const distanceSquared = dx * dx + dy * dy + dz * dz;
+      if (distanceSquared > maxDistanceSquared) continue;
+      if (avoidCentre) {
+        if (Math.hypot(node.x + dx / 2, node.y + dy / 2) < 0.25) continue;
+        // A chord can enter the opening even when its midpoint is outside it.
+        const t = Math.max(
+          0,
+          Math.min(1, -(node.x * dx + node.y * dy) / distanceSquared),
+        );
+        if (Math.hypot(node.x + t * dx, node.y + t * dy) < 0.25) continue;
+      }
+      const sameCluster =
+        node.cluster !== undefined && node.cluster === other.cluster;
+      const score = distanceSquared * (sameCluster ? clusterBias : 1);
+      const rank = nearest.findIndex((entry) => entry.score > score);
+      if (rank !== -1) nearest.splice(rank, 0, { j, score });
+      else if (nearest.length < maxNeighbors) nearest.push({ j, score });
+      if (nearest.length > maxNeighbors) nearest.pop();
+    }
+
+    for (const { j } of nearest) {
+      const key = Math.min(i, j) * count + Math.max(i, j);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      pairs.push([i, j]);
+    }
+  }
+  return pairs;
+}
+
+function buildMeshPaths(
+  pairs: Array<[number, number]>,
+  placed: PlacedNode[],
+  projected: ReadonlyMap<string, Pick<Point, "x" | "y"> & { depth: number }>,
+  mode: "2D" | "3D",
+) {
+  const front: string[] = [];
+  const back: string[] = [];
+  for (const [i, j] of pairs) {
+    const from = projected.get(placed[i].id)!;
+    const to = projected.get(placed[j].id)!;
+    const segments =
+      mode === "3D" && (from.depth + to.depth) / 2 < 0 ? back : front;
+    segments.push(`M ${from.x} ${from.y} L ${to.x} ${to.y}`);
+  }
+  return { front: front.join(" "), back: back.join(" ") };
 }
 
 export function MemoryGraphView({
@@ -56,7 +163,9 @@ export function MemoryGraphView({
   const frame = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ w: 900, h: 560 });
   const [mode, setMode] = useState<"2D" | "3D">("2D");
+  const [shape, setShape] = useState<GraphShape>("ring");
   const [detail, setDetail] = useState(true);
+  const [showLabels, setShowLabels] = useState(false);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [hovered, setHovered] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
@@ -111,19 +220,29 @@ export function MemoryGraphView({
     [material, conclusions, expanded, similar],
   );
   const placed = useMemo(
-    () => (mode === "2D" ? placeGraph2D(graph) : placeGraph(graph)),
-    [graph, mode],
+    () => (mode === "2D" ? placeGraph2D(graph, shape) : placeGraph(graph)),
+    [graph, mode, shape],
   );
-  const projected = useMemo(
+  const documentAnchors = useMemo(
     () =>
       new Map(
+        placed
+          .filter((node) => node.kind === "document")
+          .map((node) => [node.cluster, node]),
+      ),
+    [placed],
+  );
+  const projected = useMemo(
+    () => {
+      const scale = Math.min(size.w, size.h) * 0.47;
+      return new Map(
         placed.map((node) => {
           if (mode === "2D")
             return [
               node.id,
               {
-                x: pixel(size.w / 2 + node.x * size.w * 0.47),
-                y: pixel(size.h / 2 + node.y * size.h * 0.46),
+                x: pixel(size.w / 2 + node.x * scale),
+                y: pixel(size.h / 2 + node.y * scale),
                 depth: 1,
               },
             ];
@@ -145,8 +264,17 @@ export function MemoryGraphView({
             },
           ];
         }),
-      ),
+      );
+    },
     [placed, size, rotation, mode],
+  );
+  const meshPairs = useMemo(
+    () => buildMeshPairs(placed, mode, shape),
+    [placed, mode, shape],
+  );
+  const mesh = useMemo(
+    () => buildMeshPaths(meshPairs, placed, projected, mode),
+    [meshPairs, placed, projected, mode],
   );
   const drawOrder = useMemo(
     () =>
@@ -158,6 +286,16 @@ export function MemoryGraphView({
   );
   const selectedNode = graph.nodes.find((node) => node.id === selected);
   const focus = selectedNode?.id;
+  const queryActive = query.trim() !== "";
+  const sphereMesh = mode === "2D" && shape === "sphere";
+  const meshOpacity =
+    focus || queryActive
+      ? 0.025
+      : placed.length > 200
+        ? (sphereMesh ? 0.11 : 0.14)
+        : placed.length > 60
+          ? (sphereMesh ? 0.15 : 0.19)
+          : (sphereMesh ? 0.2 : 0.24);
   const neighbours = useMemo(() => {
     const ids = new Set<string>();
     if (focus) ids.add(focus);
@@ -184,31 +322,42 @@ export function MemoryGraphView({
 
   // Labels are placed in screen space and rejected on collision, including after zoom.
   const labels = useMemo(() => {
-    const occupied: Array<{ x: number; y: number; w: number }> = [];
     const result = new Map<string, { x: number; y: number; text: string }>();
+    if (!showLabels && !focus && matched.size === 0) return result;
+    const occupied: Array<{ x: number; y: number; w: number }> = [];
     const priority = (node: GraphNode) =>
       node.id === focus
         ? 10000
         : matched.has(node.id)
           ? 5000
-          : node.kind === "conclusion"
+          : showLabels && node.kind === "conclusion"
             ? 1000
-            : node.kind === "document"
+            : showLabels && node.kind === "document"
               ? 100 + (node.weight ?? 1)
               : 0;
     const candidates = [...placed].sort((a, b) => priority(b) - priority(a));
     for (const node of candidates) {
       if (result.size >= 18 && node.id !== focus) break;
-      if (priority(node) === 0 || (focus && !neighbours.has(node.id))) continue;
+      if (priority(node) === 0) break;
+      if (focus && !neighbours.has(node.id) && !matched.has(node.id)) continue;
       const at = projected.get(node.id)!;
-      if (mode === "3D" && at.depth < -0.2 && node.id !== focus) continue;
+      if (
+        mode === "3D" &&
+        at.depth < -0.2 &&
+        node.id !== focus &&
+        !matched.has(node.id)
+      )
+        continue;
       const text =
         node.label.length > 25 ? `${node.label.slice(0, 24)}…` : node.label;
       const w = [...text].reduce(
         (sum, char) => sum + (char.charCodeAt(0) > 255 ? 11 : 6.2),
         0,
       );
-      const x = (at.x - box.x) / unit + radius(node) + 7;
+      const centreX = (at.x - box.x) / unit;
+      const gap = radius(node) + 7;
+      const right = centreX + gap;
+      const x = right + w <= size.w - 12 ? right : centreX - gap - w;
       const y = (at.y - box.y) / unit + 4;
       if (x < 0 || x + w > size.w - 12 || y < 18 || y > size.h - 12) continue;
       if (
@@ -230,6 +379,7 @@ export function MemoryGraphView({
     focus,
     neighbours,
     matched,
+    showLabels,
     mode,
     box.x,
     box.y,
@@ -287,106 +437,12 @@ export function MemoryGraphView({
       : material.filter((item) => item.sourceFile === selectedSource);
 
   return (
-    <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-base-100 text-base-content">
-      <div className="flex flex-wrap items-center gap-3 border-b border-base-content/10 px-5 py-3">
-        <div className="mr-2">
-          <div className="text-sm font-medium tracking-wide">记忆图谱</div>
-          <div className="mt-0.5 text-[11px] text-base-content/65">
-            已加载 {graph.nodes.length} 个节点 · {graph.edges.length} 条连接
-          </div>
-        </div>
-        <div className="relative min-w-40 flex-1">
-          <input
-            aria-label="搜索图谱"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && matches[0]) locate(matches[0]);
-              if (event.key === "Escape") setQuery("");
-            }}
-            placeholder="搜索文档、素材或结论…"
-            className="w-full rounded-lg border border-base-content/15 bg-base-200 px-3 py-2 text-xs text-base-content outline-none placeholder:text-base-content/65 focus:border-primary/70"
-          />
-          {query.trim() && (
-            <div className="absolute left-0 right-0 top-full z-20 mt-2 rounded-lg border border-base-content/15 bg-base-200 p-2 shadow-xl">
-              <div className="px-2 py-1 text-[11px] text-base-content/65">
-                {matches.length
-                  ? `${matches.length} 个匹配 · 选择以定位`
-                  : "没有匹配的节点"}
-              </div>
-              {matches.slice(0, 7).map((node) => (
-                <button
-                  key={node.id}
-                  className={`${control} block w-full truncate text-left`}
-                  onClick={() => locate(node)}
-                >
-                  {node.label}
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
-        <div className="flex rounded-lg bg-base-200 p-1" aria-label="图谱维度">
-          {(["2D", "3D"] as const).map((value) => (
-            <button
-              key={value}
-              aria-pressed={mode === value}
-              className={`${control} ${mode === value ? "bg-base-content/10 text-base-content" : ""}`}
-              onClick={() => {
-                setMode(value);
-                setView(null);
-              }}
-            >
-              {value}
-            </button>
-          ))}
-        </div>
-        <button
-          aria-pressed={detail}
-          className={`${control} border border-base-content/15`}
-          onClick={() => {
-            setDetail(!detail);
-            setCollapsed(new Set());
-          }}
-        >
-          {detail ? "收起分块" : "展开分块"}
-        </button>
-        <div className="flex items-center gap-0.5 border-l border-base-content/15 pl-2">
-          <button
-            className={control}
-            aria-label="放大"
-            onClick={() => zoom(1 / 1.4)}
-          >
-            ＋
-          </button>
-          <button
-            className={control}
-            aria-label="缩小"
-            onClick={() => zoom(1.4)}
-          >
-            −
-          </button>
-          <button
-            className={control}
-            onClick={() => {
-              setView(null);
-              setRotation({ yaw: 0, pitch: 0 });
-              setSelected(null);
-              setQuery("");
-            }}
-          >
-            复位
-          </button>
-        </div>
-      </div>
-      <div
-        ref={frame}
-        className="relative min-h-0 min-w-0 flex-1 overflow-hidden"
-      >
+    <div className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden bg-[var(--mdx-content-bg)] text-base-content @container">
+      <div ref={frame} className="relative min-h-0 min-w-0 flex-1">
         {graph.nodes.length > 0 && (
           <svg
             viewBox={`${box.x} ${box.y} ${box.w} ${box.h}`}
-            className="block h-full w-full cursor-grab touch-none select-none active:cursor-grabbing"
+            className="absolute inset-0 block size-full cursor-grab touch-none select-none active:cursor-grabbing"
             role="img"
             aria-label="记忆关系图"
             onWheel={(event) => {
@@ -415,7 +471,7 @@ export function MemoryGraphView({
               if (!from) return;
               if (!from.dragged) {
                 if (
-                  Math.hypot(event.clientX - from.x, event.clientY - from.y) < 4
+                  Math.hypot(event.clientX - from.x, event.clientY - from.y) <= 4
                 )
                   return;
                 from.dragged = true;
@@ -461,6 +517,22 @@ export function MemoryGraphView({
                 setSelected(null);
             }}
           >
+            {(["back", "front"] as const).map(
+              (side) =>
+                mesh[side] && (
+                  <path
+                    key={side}
+                    data-mesh-edge=""
+                    d={mesh[side]}
+                    pointerEvents="none"
+                    stroke="#40a9b2"
+                    strokeWidth={0.65}
+                    vectorEffect="non-scaling-stroke"
+                    fill="none"
+                    opacity={side === "back" ? meshOpacity / 2 : meshOpacity}
+                  />
+                ),
+            )}
             {graph.edges.map((edge) => {
               const from = projected.get(edge.from),
                 to = projected.get(edge.to);
@@ -474,11 +546,11 @@ export function MemoryGraphView({
                 edge.kind === "contradicts"
                   ? "var(--color-error)"
                   : edge.kind === "holds"
-                    ? COLORS.document
+                    ? "#3fa3ad"
                     : edge.kind === "verifies"
                       ? COLORS.verification
                       : edge.kind === "similar"
-                        ? COLORS.material
+                        ? "#3b7ddd"
                         : COLORS.adopted;
               return (
                 <line
@@ -491,14 +563,14 @@ export function MemoryGraphView({
                   stroke={stroke}
                   opacity={
                     active
-                      ? 0.85
+                      ? 0.88
                       : focus
                         ? 0.055
                         : edge.kind === "holds"
-                          ? 0.32
-                          : 0.55
+                          ? 0.28
+                          : 0.42
                   }
-                  strokeWidth={active ? 1.4 : 0.7}
+                  strokeWidth={active ? 1.35 : edge.kind === "holds" ? 0.65 : 0.75}
                   vectorEffect="non-scaling-stroke"
                   strokeDasharray={edge.kind === "similar" ? "4 4" : undefined}
                 />
@@ -512,12 +584,19 @@ export function MemoryGraphView({
                 matched.has(node.id);
               const dim =
                 (focus && !neighbours.has(node.id)) ||
-                (query.trim() && !matched.has(node.id));
-              const r = radius(node) * unit;
+                (queryActive && !matched.has(node.id));
+              const depthScale =
+                mode === "3D" ? 0.72 + (at.depth + 1) * 0.22 : 1;
+              const r = radius(node) * depthScale * unit;
+              const anchor = node.cluster
+                ? (documentAnchors.get(node.cluster) ?? node)
+                : node;
+              const fill = nodeColor(node, anchor);
+              const highlight = active ? "var(--color-base-content)" : undefined;
               // A hover label is added locally; the overview labels never reflow on hover.
               const label =
                 labels.get(node.id) ??
-                (node.id === hovered
+                (node.id === hovered || node.id === focus
                   ? {
                       x: at.x + (radius(node) + 7) * unit,
                       y: at.y - (radius(node) + 7) * unit,
@@ -563,33 +642,45 @@ export function MemoryGraphView({
                     r={Math.max(8 * unit, r * 2)}
                     fill="transparent"
                   />
-                  {(active ||
-                    node.kind === "conclusion" ||
-                    node.kind === "document") && (
+                  <circle
+                    cx={at.x}
+                    cy={at.y}
+                    r={r * (active ? 3.4 : 2.5)}
+                    fill={fill}
+                    opacity={
+                      active ? 0.26 : node.kind === "material" ? 0.14 : 0.18
+                    }
+                    pointerEvents="none"
+                  />
+                  {node.kind === "conclusion" && (
                     <circle
                       cx={at.x}
                       cy={at.y}
-                      r={r * (active ? 2.6 : 2)}
-                      fill={color(node)}
-                      opacity={active ? 0.2 : 0.09}
+                      r={r * 1.55}
+                      fill="none"
+                      stroke={fill}
+                      strokeWidth={0.9}
+                      opacity={0.55}
+                      vectorEffect="non-scaling-stroke"
                       pointerEvents="none"
                     />
                   )}
                   {node.kind === "verification" ? (
                     <path
                       d={`M ${at.x} ${at.y - r} l ${r} ${r} l ${-r} ${r} l ${-r} ${-r} Z`}
-                      fill={color(node)}
+                      fill={fill}
+                      stroke={highlight}
+                      strokeWidth={active ? 1.4 : undefined}
+                      vectorEffect="non-scaling-stroke"
                     />
                   ) : (
                     <circle
                       cx={at.x}
                       cy={at.y}
                       r={r}
-                      fill={color(node)}
-                      stroke={
-                        active ? "var(--color-base-content)" : color(node)
-                      }
-                      strokeWidth={active ? 1.5 : 0.4}
+                      fill={fill}
+                      stroke={highlight}
+                      strokeWidth={active ? 1.4 : undefined}
                       vectorEffect="non-scaling-stroke"
                     />
                   )}
@@ -619,23 +710,27 @@ export function MemoryGraphView({
           </div>
         )}
         {selectedNode && (
-          <aside className="absolute right-4 top-4 w-72 max-w-[80%] rounded-xl border border-base-content/15 bg-base-200 p-4 text-xs shadow-xl">
+          <aside className="absolute right-4 top-16 z-20 w-72 max-w-[calc(100%-2rem)] rounded-[var(--mdx-panel-radius)] bg-base-100/92 p-4 text-xs shadow-[var(--mdx-panel-shadow)] backdrop-blur-md @max-[720px]:top-40">
             <div className="mb-3 flex items-start justify-between gap-3">
-              <div className="break-all leading-relaxed text-base-content">
+              <div className="flex flex-wrap items-center gap-1.5 break-all leading-relaxed">
+                <Chip
+                  tone={selectedNode.kind === "conclusion" ? "warning" : "neutral"}
+                >
+                  {NODE_KIND_LABELS[selectedNode.kind]}
+                </Chip>
                 {selectedNode.label}
               </div>
-              <button
+              <TextControlButton
                 aria-label="关闭"
-                className="text-base-content/65 hover:text-base-content"
                 onClick={() => setSelected(null)}
               >
                 ×
-              </button>
+              </TextControlButton>
             </div>
             {selectedSource !== null ? (
               <>
                 <p className="mb-3 text-base-content/65">
-                  文档 · {selectedChunks.length} 条素材 ·{" "}
+                  {selectedChunks.length} 条素材 ·{" "}
                   {expanded.has(selectedSource)
                     ? "点击节点收起"
                     : "点击节点展开"}
@@ -655,15 +750,11 @@ export function MemoryGraphView({
               </>
             ) : (
               <div className="flex gap-2">
-                <button
-                  className={control}
-                  onClick={() => onSelect(selectedNode.id)}
-                >
+                <PrimaryTextControlButton onClick={() => onSelect(selectedNode.id)}>
                   查看全文
-                </button>
-                <button
+                </PrimaryTextControlButton>
+                <TextControlButton
                   disabled={searching}
-                  className={`${control} disabled:opacity-40`}
                   onClick={async () => {
                     const id = selectedNode.id;
                     setSearching(true);
@@ -683,7 +774,7 @@ export function MemoryGraphView({
                   }}
                 >
                   {searching ? "查找中…" : "找相似"}
-                </button>
+                </TextControlButton>
               </div>
             )}
             {error && (
@@ -694,30 +785,141 @@ export function MemoryGraphView({
           </aside>
         )}
       </div>
-      <div className="flex flex-wrap items-center gap-x-5 gap-y-2 border-t border-base-content/10 px-5 py-3 text-[11px] text-base-content/65">
-        <div className="flex flex-wrap gap-4">
-          {[
-            [COLORS.document, "文档"],
-            [COLORS.material, "素材"],
-            [COLORS.adopted, "已采纳"],
-            [COLORS.candidate, "候选结论"],
-            [COLORS.verification, "采纳记录"],
-          ].map(([fill, name]) => (
-            <span key={name} className="flex items-center gap-1.5">
-              <span
-                className="h-1.5 w-1.5 rounded-full"
-                style={{ backgroundColor: fill }}
+      {graph.nodes.length > 0 && (
+        <>
+          <div className="absolute left-4 top-4 z-10 flex max-w-[min(460px,calc(100%-2rem))] flex-wrap items-center gap-2.5 rounded-[var(--mdx-panel-radius)] bg-base-100/85 px-3 py-2 shadow-[var(--mdx-panel-shadow)] backdrop-blur-md focus-within:z-30 @max-[720px]:top-16">
+            <div>
+              <div className="text-sm font-medium">记忆图谱</div>
+              <div className="text-[11px] text-base-content/65">
+                已加载 {graph.nodes.length} 个节点 · {graph.edges.length} 条连接
+              </div>
+            </div>
+            <div
+              className="relative min-w-[min(10rem,100%)] flex-1"
+              onKeyDown={(event) => {
+                if (
+                  event.key === "Enter" &&
+                  event.target instanceof HTMLInputElement &&
+                  matches[0]
+                )
+                  locate(matches[0]);
+                if (event.key === "Escape") setQuery("");
+              }}
+            >
+              <SearchField
+                label="搜索图谱"
+                placeholder="搜索文档、素材或结论…"
+                value={query}
+                onChange={setQuery}
               />
-              {name}
+              {queryActive && (
+                <div className="absolute inset-x-0 top-full mt-2 rounded-[var(--mdx-panel-radius)] bg-base-100/95 p-1.5 shadow-[var(--mdx-panel-shadow)] backdrop-blur-md">
+                  <div className="px-2 py-1 text-[11px] text-base-content/65">
+                    {matches.length
+                      ? `${matches.length} 个匹配 · 选择以定位`
+                      : "没有匹配的节点"}
+                  </div>
+                  {matches.slice(0, 7).map((node) => (
+                    <TextControlButton
+                      key={node.id}
+                      className="w-full"
+                      onClick={() => locate(node)}
+                    >
+                      <span className="w-full truncate text-left">
+                        {node.label}
+                      </span>
+                    </TextControlButton>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+          <div className="absolute right-4 top-4 z-10 flex items-center gap-1.5 rounded-[var(--mdx-panel-radius)] bg-base-100/85 p-1.5 shadow-[var(--mdx-panel-shadow)] backdrop-blur-md">
+            <SegmentedControl
+              label="图谱维度"
+              value={mode}
+              options={[
+                { value: "2D", label: "2D" },
+                { value: "3D", label: "3D" },
+              ]}
+              onChange={(value) => {
+                setMode(value);
+                setView(null);
+              }}
+            />
+            {mode === "2D" && (
+              <SegmentedControl
+                label="图谱形态"
+                value={shape}
+                options={[
+                  { value: "ring", label: "环形" },
+                  { value: "sphere", label: "星团" },
+                ]}
+                onChange={(value) => {
+                  setShape(value);
+                  setView(null);
+                }}
+              />
+            )}
+            <TextControlButton
+              aria-pressed={detail}
+              onClick={() => {
+                setDetail(!detail);
+                setCollapsed(new Set());
+              }}
+            >
+              {detail ? "收起分块" : "展开分块"}
+            </TextControlButton>
+            <TextControlButton
+              aria-pressed={showLabels}
+              className="aria-pressed:bg-base-content/10 aria-pressed:text-base-content"
+              onClick={() => setShowLabels(!showLabels)}
+            >
+              标签
+            </TextControlButton>
+          </div>
+          <div className="absolute bottom-4 right-4 z-10 flex items-center gap-0.5 rounded-[var(--mdx-panel-radius)] bg-base-100/85 p-1 shadow-[var(--mdx-panel-shadow)] backdrop-blur-md">
+            <TextControlButton aria-label="放大" onClick={() => zoom(1 / 1.4)}>
+              ＋
+            </TextControlButton>
+            <TextControlButton aria-label="缩小" onClick={() => zoom(1.4)}>
+              −
+            </TextControlButton>
+            <TextControlButton
+              onClick={() => {
+                setView(null);
+                setRotation({ yaw: 0, pitch: 0 });
+                setSelected(null);
+                setQuery("");
+              }}
+            >
+              复位
+            </TextControlButton>
+          </div>
+          <div className="pointer-events-none absolute bottom-4 left-4 z-10 flex max-w-[calc(100%-9rem)] flex-wrap items-center gap-x-3.5 gap-y-1 rounded-[var(--mdx-panel-radius)] bg-base-100/75 px-3 py-1.5 text-[11px] text-base-content/60 backdrop-blur-md">
+            <span className="flex items-center gap-1.5">
+              <span className="h-1.5 w-5 rounded-full bg-[linear-gradient(90deg,#3b7ddd,#8b5fbf,#d95f66)]" />
+              文档 / 素材
             </span>
-          ))}
-        </div>
-        <span>实线：归属 / 引用 · 虚线：检索相近</span>
-        <span className="ml-auto">
-          {mode === "2D" ? "拖拽平移" : "拖拽旋转"} · 滚轮缩放 · 点击查看
-        </span>
-        {graph.missing > 0 && <span>{graph.missing} 条引用素材未加载</span>}
-      </div>
+            {[
+              [COLORS.adopted, "已采纳"],
+              [COLORS.candidate, "候选结论"],
+              [COLORS.verification, "采纳记录"],
+            ].map(([fill, name]) => (
+              <span key={name} className="flex items-center gap-1.5">
+                <span
+                  className="h-1.5 w-1.5 rounded-full"
+                  style={{ backgroundColor: fill }}
+                />
+                {name}
+              </span>
+            ))}
+            <span>实线：归属 / 引用 · 虚线：检索相近</span>
+            <span>{mode === "2D" ? "拖拽平移" : "拖拽旋转"} · 滚轮缩放</span>
+            {graph.missing > 0 && <span>{graph.missing} 条引用素材未加载</span>}
+          </div>
+        </>
+      )}
     </div>
   );
 }

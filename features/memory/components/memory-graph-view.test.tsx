@@ -152,6 +152,119 @@ describe("MemoryGraphView", () => {
     expect(host.querySelectorAll("[data-edge-kind=holds]")).toHaveLength(0);
   });
 
+  it("draws the constellation mesh separately from real links", () => {
+    mount({
+      material: Array.from({ length: 8 }, (_, i) =>
+        chunk(`ev_${i}`, `notes/${i}.md`),
+      ),
+    });
+
+    const svg = host.querySelector('svg[aria-label="记忆关系图"]')!;
+    const paths = svg.querySelectorAll("path[data-mesh-edge]");
+    expect(paths).toHaveLength(1);
+    expect(paths[0].getAttribute("d")).toMatch(/^M .+ L /);
+    expect(paths[0].getAttribute("pointer-events")).toBe("none");
+    expect(paths[0].getAttribute("opacity")).toBe("0.24");
+    expect(svg.querySelectorAll("line")).toHaveLength(8);
+    expect(svg.querySelectorAll('line[data-edge-kind="holds"]')).toHaveLength(8);
+
+    act(() =>
+      svg.querySelector('[data-node-id="ev_0"]')!.dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      ),
+    );
+    expect(paths[0].getAttribute("opacity")).toBe("0.025");
+  });
+
+  it("switches 2D shapes and rotates a layered 3D mesh without losing nodes", () => {
+    mount({
+      material: Array.from({ length: 8 }, (_, i) =>
+        chunk(`ev_${i}`, `notes/${i}.md`),
+      ),
+    });
+    const svg = host.querySelector("svg")!;
+    const button = (label: string) =>
+      [...host.querySelectorAll("button")].find(
+        (item) => item.textContent === label,
+      )!;
+    const meshPaths = () => [...svg.querySelectorAll("path[data-mesh-edge]")];
+    const nodeIds = () =>
+      [...svg.querySelectorAll("[data-node-id]")]
+        .map((node) => node.getAttribute("data-node-id"))
+        .sort();
+    const nodes = nodeIds();
+    const ring = meshPaths()[0].getAttribute("d");
+    const overview = svg.getAttribute("viewBox");
+
+    expect(button("环形").getAttribute("aria-pressed")).toBe("true");
+    act(() => button("＋").click());
+    expect(svg.getAttribute("viewBox")).not.toBe(overview);
+    act(() => button("星团").click());
+    expect(button("星团").getAttribute("aria-pressed")).toBe("true");
+    expect(button("环形").getAttribute("aria-pressed")).toBe("false");
+    expect(svg.getAttribute("viewBox")).toBe(overview);
+    expect(meshPaths()).toHaveLength(1);
+    const sphere = meshPaths()[0].getAttribute("d");
+    expect(sphere).toMatch(/^M .+ L /);
+    expect(sphere).not.toBe(ring);
+    expect(meshPaths()[0].getAttribute("opacity")).toBe("0.2");
+    expect(nodeIds()).toEqual(nodes);
+
+    act(() => button("3D").click());
+    expect(host.querySelector('[aria-label="图谱形态"]')).toBeNull();
+    expect(meshPaths()).toHaveLength(2);
+    const [back, front] = meshPaths();
+    expect(back.getAttribute("d")).toMatch(/^M .+ L /);
+    expect(front.getAttribute("d")).toMatch(/^M .+ L /);
+    expect(front.getAttribute("opacity")).toBe("0.24");
+    expect(back.getAttribute("opacity")).toBe("0.12");
+    const globe = meshPaths().map((path) => path.getAttribute("d"));
+
+    svg.setPointerCapture = vi.fn();
+    svg.releasePointerCapture = vi.fn();
+    act(() => {
+      svg.dispatchEvent(pointer("pointerdown", 100, 100));
+      svg.dispatchEvent(pointer("pointermove", 240, 180));
+      svg.dispatchEvent(pointer("pointerup", 240, 180));
+    });
+    const rotated = meshPaths().map((path) => path.getAttribute("d"));
+    expect(rotated).not.toEqual(globe);
+    expect(rotated.join(" ").match(/M /g)).toHaveLength(
+      globe.join(" ").match(/M /g)!.length,
+    );
+    expect(svg.getAttribute("viewBox")).toBe(overview);
+    expect(nodeIds()).toEqual(nodes);
+
+    act(() => button("2D").click());
+    expect(button("星团").getAttribute("aria-pressed")).toBe("true");
+    act(() => button("环形").click());
+    expect(meshPaths()[0].getAttribute("d")).toBe(ring);
+  });
+
+  it("hides overview labels by default while keeping hover and selection labels", () => {
+    mount();
+    const doc = host.querySelector('[data-node-id="doc:notes/one.md"]')!;
+    const labels = [...host.querySelectorAll("button")].find(
+      (button) => button.textContent === "标签",
+    )!;
+
+    expect(labels.getAttribute("aria-pressed")).toBe("false");
+    expect(doc.querySelector("text")).toBeNull();
+    act(() => doc.dispatchEvent(new MouseEvent("mouseover", { bubbles: true })));
+    expect(doc.querySelector("text")?.textContent).toBe("one.md");
+    act(() => doc.dispatchEvent(new MouseEvent("mouseout", { bubbles: true })));
+    expect(doc.querySelector("text")).toBeNull();
+
+    act(() => labels.click());
+    expect(labels.getAttribute("aria-pressed")).toBe("true");
+    expect(doc.querySelector("text")?.textContent).toBe("one.md");
+
+    act(() => labels.click());
+    act(() => doc.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(labels.getAttribute("aria-pressed")).toBe("false");
+    expect(doc.querySelector("text")?.textContent).toBe("one.md");
+  });
+
   it("says what a clicked document holds, and opens a chunk from the card", () => {
     // A document node has no entry of its own, and its click used to be a dead
     // end: more dots, no way to read anything. The card is the content path.

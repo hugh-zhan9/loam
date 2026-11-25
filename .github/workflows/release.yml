@@ -1,4 +1,4 @@
-name: Build MDX
+name: Build & Release Loam
 
 on:
   push:
@@ -13,9 +13,13 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+
 jobs:
   build-macos:
-    name: macOS arm64
+    name: macOS Apple Silicon (arm64)
     runs-on: macos-14
     env:
       TARGET: aarch64-apple-darwin
@@ -27,7 +31,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - name: Setup Rust
@@ -35,8 +39,18 @@ jobs:
         with:
           targets: ${{ env.TARGET }}
 
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
       - name: Install frontend dependencies
         run: npm ci
+
+      - name: Lint & audit editor boundaries
+        run: |
+          npm run lint
+          npm run audit:editor:boundaries
 
       - name: Test frontend
         run: npm run test
@@ -46,31 +60,75 @@ jobs:
           TAURI_CONFIG: '{"bundle":{"externalBin":[]}}'
         run: cargo test --manifest-path src-tauri/Cargo.toml --target ${{ env.TARGET }}
 
-      - name: Build sidecars
+      - name: Build Loam.app
+        if: github.event_name != 'pull_request'
         env:
           TAURI_TARGET_TRIPLE: ${{ env.TARGET }}
-        run: npm run build:sidecars
+        run: npx tauri build --target ${{ env.TARGET }} --bundles app
 
-      - name: Build app
-        env:
-          TAURI_TARGET_TRIPLE: ${{ env.TARGET }}
-        run: npx tauri build --target ${{ env.TARGET }}
+      - name: Ad-hoc sign & package DMG
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          APP_PATH="src-tauri/target/${TARGET}/release/bundle/macos/Loam.app"
+          VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          DMG_NAME="Loam_${VERSION}_aarch64.dmg"
+
+          codesign --force --deep --sign - "${APP_PATH}"
+          codesign --verify --deep --strict "${APP_PATH}"
+
+          rm -rf dist
+          mkdir -p dist/dmg-root
+          cp -R "${APP_PATH}" dist/dmg-root/
+          ln -s /Applications dist/dmg-root/Applications
+
+          hdiutil create \
+            -volname "Loam ${VERSION}" \
+            -srcfolder dist/dmg-root \
+            -ov \
+            -format UDZO \
+            "dist/${DMG_NAME}"
+
+          (cd dist && shasum -a 256 "${DMG_NAME}" > SHA256SUMS.txt)
+          ls -lh dist/
 
       - name: Upload build artifact
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
-          name: mdx-macos-arm64
+          name: loam-macos-arm64
           path: |
-            src-tauri/target/${{ env.TARGET }}/release/bundle/dmg/*.dmg
-            src-tauri/target/${{ env.TARGET }}/release/bundle/macos/*.app.tar.gz
-            src-tauri/target/${{ env.TARGET }}/release/bundle/macos/*.app.tar.gz.sig
-          if-no-files-found: warn
+            dist/*.dmg
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
 
-      - name: Upload release assets
+      - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          body: |
+            ### 下载与安装（macOS Apple Silicon / M1–M4）
+
+            1. 下载下方的 `Loam_*_aarch64.dmg` 并双击打开，将 **Loam.app** 拖入 **Applications（应用程序）** 文件夹。
+            2. 由于本安装包未使用付费 Apple Developer 证书公证，首次打开时 macOS 可能会提示“已损坏”或“无法验证开发者”。请在终端执行以下命令解除隔离属性后即可正常打开：
+
+            ```bash
+            xattr -dr com.apple.quarantine /Applications/Loam.app
+            ```
+
+            ---
+
+            ### Download & Install (macOS Apple Silicon)
+
+            1. Download `Loam_*_aarch64.dmg`, open it, and drag **Loam.app** into **Applications**.
+            2. This build is ad-hoc signed without Apple notarization. If macOS Gatekeeper blocks the first launch, clear the quarantine attribute in Terminal:
+
+            ```bash
+            xattr -dr com.apple.quarantine /Applications/Loam.app
+            ```
           files: |
-            src-tauri/target/${{ env.TARGET }}/release/bundle/dmg/*.dmg
+            dist/*.dmg
+            dist/SHA256SUMS.txt
